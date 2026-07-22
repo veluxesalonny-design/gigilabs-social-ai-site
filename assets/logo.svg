@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+<title id="title">GIGILABS</title><desc id="desc">Metallic technology emblem with circuit lines and the GIGILABS wordmark.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#06070a"/><stop offset="1" stop-color="#000"/></linearGradient>
+  <linearGradient id="metal" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f4f6f8"/><stop offset=".22" stop-color="#9ea4ad"/><stop offset=".48" stop-color="#e4e7eb"/><stop offset=".72" stop-color="#727983"/><stop offset="1" stop-color="#d8dce2"/></linearGradient>
+  <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#ffffff"/><stop offset=".5" stop-color="#9aa1ab"/><stop offset="1" stop-color="#4c525c"/></linearGradient>
+  <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%"><feDropShadow dx="0" dy="24" stdDeviation="22" flood-color="#000" flood-opacity=".7"/></filter>
+  <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#4e89ff" flood-opacity=".28"/></filter>
+</defs>
+<rect width="1024" height="1024" rx="90" fill="url(#bg)"/>
+<g filter="url(#shadow)">
+  <path d="M512 115c-150 0-270 121-270 271v185c0 111 64 208 158 252l42-91c-59-28-100-88-100-161V386c0-94 76-170 170-170s170 76 170 170v185c0 73-41 133-100 161l42 91c94-44 158-141 158-252V386c0-150-120-271-270-271Z" fill="url(#metal)" stroke="url(#edge)" stroke-width="8"/>
+  <path d="M398 738v90M468 692v151M538 650v193M608 696v132" fill="none" stroke="#0b0c0f" stroke-width="21" stroke-linecap="round"/>
+  <path d="M398 738v-94l-58-58v-92M468 692v-146l-56-56v-84M538 650v-138l74-74v-92M608 696v-112l68-68v-88" fill="none" stroke="#0b0c0f" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M398 738v-94l-58-58v-92M468 692v-146l-56-56v-84M538 650v-138l74-74v-92M608 696v-112l68-68v-88" fill="none" stroke="url(#metal)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#08090c" stroke="url(#metal)" stroke-width="9" filter="url(#glow)">
+    <circle cx="340" cy="476" r="16"/><circle cx="412" cy="389" r="16"/><circle cx="612" cy="329" r="16"/><circle cx="676" cy="411" r="16"/>
+  </g>
+</g>
+<text x="512" y="920" text-anchor="middle" fill="url(#metal)" font-family="Arial,Helvetica,sans-serif" font-size="116" font-weight="700" letter-spacing="14">GIGI LABS</text>
+</svg>
