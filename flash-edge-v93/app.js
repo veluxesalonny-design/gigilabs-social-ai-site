@@ -28,6 +28,6 @@ async function send(){if(!pkg?.ready||!selected||!freshPass(selected)||!receiver
 async function hydrate(){
   $('watch').textContent=watching?'AUTO BLOCK WATCH ON':'AUTO BLOCK WATCH OFF';$('watchState').textContent=$('watch').textContent;$('receiver').value=localStorage.getItem('fe941_receiver')||localStorage.getItem('fer')||'';provider=window.bitkeep?.ethereum||window.bitkeep?.ethreum||window.ethereum;
   if(provider){try{const a=await provider.request({method:'eth_accounts'});wallet=a?.[0]||'';chain=parseInt(await provider.request({method:'eth_chainId'}),16)||0}catch{}provider.on?.('accountsChanged',a=>{wallet=a?.[0]||'';receiverOK=false;resetPkg();ui()});provider.on?.('chainChanged',h=>{chain=parseInt(h,16)||0;receiverOK=false;resetPkg();ui()})}
-  ui();await scan(true);setInterval(poll,1200);
+  ui();await scan(true);setInterval(poll,1800);
 }
 $('scan').onclick=()=>scan(true);$('watch').onclick=toggleWatch;$('connect').onclick=connect;$('switch').onclick=switchBase;$('verifyReceiver').onclick=verifyReceiver;$('prepare').onclick=prepare;$('send').onclick=send;$('receiver').oninput=()=>{receiverOK=false;resetPkg();ui()};hydrate();
