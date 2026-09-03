@@ -6,70 +6,47 @@ const RPCS=['https://base-rpc.publicnode.com','https://mainnet.base.org','https:
 const APPROVED_RUNTIME='0x370c586265de600f83c972751bc334e493b07fe33ee100f84fb710763d732cad';
 const USDC='0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const AAVE='0xA238Dd80C259a72e81d7e4664a9801593F98d1c5';
-const UNI3F='0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
-const AEROCLF='0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef';
+const UNI_V2_ROUTER='0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24';
+const SUSHI_V2_ROUTER='0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891';
+const UNI_V3_FACTORY='0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
+const UNI_V3_ROUTER='0x2626664c2603336E57B271c5C0b26F421741e481';
+const AERO_REGISTRY='0x5C3F18F06CC09CA1910767A34a20F771039E37C0';
+const AERO_CLASSIC_FACTORY='0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
+const AERO_CLASSIC_ROUTER='0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43';
+const AERO_CL_FACTORY='0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef';
+const AERO_CL_ROUTER='0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F';
 const GPO='0x420000000000000000000000000000000000000F';
 const WETH='0x4200000000000000000000000000000000000006';
 const norm=x=>String(x||'').toLowerCase();
 const addr=x=>/^0x[0-9a-fA-F]{40}$/.test(String(x||''));
 const num=x=>Number.isFinite(Number(x))?Number(x):0;
-let rpcCursor=0;
-const rpcState=RPCS.map(()=>({coolUntil:0,failures:0}));
 
 const receiverAbi=[{type:'function',name:'executeArbitrage',stateMutability:'nonpayable',inputs:[{name:'p',type:'tuple',components:[{name:'quoteToken',type:'address'},{name:'borrow',type:'uint256'},{name:'minProfit',type:'uint256'},{name:'deadline',type:'uint64'},{name:'buy',type:'tuple',components:[{name:'kind',type:'uint8'},{name:'venue',type:'uint8'},{name:'pair',type:'address'},{name:'tokenIn',type:'address'},{name:'tokenOut',type:'address'},{name:'fee',type:'uint24'},{name:'tickSpacing',type:'int24'},{name:'stable',type:'bool'},{name:'minOut',type:'uint256'}]},{name:'sell',type:'tuple',components:[{name:'kind',type:'uint8'},{name:'venue',type:'uint8'},{name:'pair',type:'address'},{name:'tokenIn',type:'address'},{name:'tokenOut',type:'address'},{name:'fee',type:'uint24'},{name:'tickSpacing',type:'int24'},{name:'stable',type:'bool'},{name:'minOut',type:'uint256'}]}]}],outputs:[]}];
-const viewAbi=parseAbi(['function owner() view returns(address)','function paused() view returns(bool)','function maxBorrowRaw() view returns(uint256)','function authorizedQuote() view returns(address)','function aavePool() view returns(address)','function uniV3Factory() view returns(address)','function aeroClFactory() view returns(address)']);
+const viewAbi=parseAbi(['function owner() view returns(address)','function paused() view returns(bool)','function maxBorrowRaw() view returns(uint256)','function authorizedQuote() view returns(address)','function aavePool() view returns(address)','function uniV2Router() view returns(address)','function sushiV2Router() view returns(address)','function uniV3Factory() view returns(address)','function uniV3Router() view returns(address)','function aeroFactoryRegistry() view returns(address)','function aeroClassicFactory() view returns(address)','function aeroClassicRouter() view returns(address)','function aeroClFactory() view returns(address)','function aeroClRouter() view returns(address)']);
 const feeAbi=parseAbi(['function getL1FeeUpperBound(uint256) view returns(uint256)','function getOperatorFee(uint256) view returns(uint256)']);
-
-async function rpc(method,params=[],ms=3800){
-  let last='Base RPC unavailable';
-  const now=Date.now(),start=rpcCursor++%RPCS.length;
-  for(let pass=0;pass<2;pass++){
-    for(let i=0;i<RPCS.length;i++){
-      const idx=(start+i)%RPCS.length,state=rpcState[idx];if(pass===0&&state.coolUntil>now)continue;
-      const url=RPCS[idx],c=new AbortController(),t=setTimeout(()=>c.abort(),ms);
-      try{
-        const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
-        const text=await r.text();let d=null;try{d=JSON.parse(text)}catch{}
-        if(r.ok&&d&&!d.error&&d.result!=null){state.failures=0;state.coolUntil=0;return d.result}
-        const msg=d?.error?.message||text.slice(0,180)||`HTTP ${r.status}`;last=msg;state.failures++;
-        if(r.status===429||/rate limit|over rate|usage limit|forbidden|too many|<!doctype|<html/i.test(msg))state.coolUntil=Date.now()+Math.min(60000,12000*state.failures);
-      }catch(e){last=e?.message||String(e);state.failures++;state.coolUntil=Date.now()+Math.min(30000,5000*state.failures)}finally{clearTimeout(t)}
-    }
-  }
-  throw Error(last);
-}
+const providers=RPCS.map(url=>({url,fails:0,cooldownUntil:0}));let rpcCursor=0;
+function isRate(status,msg){return status===429||/rate|limit|too many|over rate|quota/i.test(String(msg||''))}
+async function rpc(method,params=[],ms=4200){const now=Date.now(),start=rpcCursor++%providers.length;let order=Array.from({length:providers.length},(_,i)=>providers[(start+i)%providers.length]);const live=order.filter(s=>s.cooldownUntil<=now);if(live.length)order=live;else order.sort((a,b)=>a.cooldownUntil-b.cooldownUntil);let last='Base RPC unavailable';for(const s of order){const c=new AbortController(),t=setTimeout(()=>c.abort(),ms);try{const r=await fetch(s.url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});const text=await r.text();let d;try{d=JSON.parse(text)}catch{d={error:{message:text||`HTTP ${r.status}`}}}if(r.ok&&!d.error&&d.result!=null){s.fails=0;s.cooldownUntil=0;return d.result}last=d.error?.message||`HTTP ${r.status}`;s.fails++;s.cooldownUntil=Date.now()+(isRate(r.status,last)?Math.min(90000,15000*s.fails):Math.min(10000,1500*s.fails))}catch(e){last=e?.message||String(e);s.fails++;s.cooldownUntil=Date.now()+Math.min(10000,1500*s.fails)}finally{clearTimeout(t)}}throw Error(last)}
 async function call(to,abi,functionName,args=[]){const data=encodeFunctionData({abi,functionName,args}),r=await rpc('eth_call',[{to,data},'latest']);return decodeFunctionResult({abi,functionName,data:r})}
-async function ethUsd(){const c=new AbortController(),t=setTimeout(()=>c.abort(),3000);try{const r=await fetch('https://api.dexscreener.com/token-pairs/v1/base/'+WETH,{signal:c.signal,headers:{accept:'application/json'}});if(!r.ok)throw Error('price');const a=await r.json(),p=a.filter(x=>num(x.priceUsd)>0).sort((x,y)=>num(y.liquidity?.usd)-num(x.liquidity?.usd))[0];if(!p)throw Error('price');return num(p.priceUsd)}catch{return 10000}finally{clearTimeout(t)}}
+async function ethUsd(){const c=new AbortController(),t=setTimeout(()=>c.abort(),3000);try{const r=await fetch('https://api.dexscreener.com/tokens/v1/base/'+WETH,{signal:c.signal,headers:{accept:'application/json'}});if(!r.ok)throw Error('price');const a=await r.json(),p=(Array.isArray(a)?a:[]).filter(x=>num(x.priceUsd)>0).sort((x,y)=>num(y.liquidity?.usd)-num(x.liquidity?.usd))[0];if(!p)throw Error('price');return num(p.priceUsd)}catch{return 10000}finally{clearTimeout(t)}}
 function kind(m){if(m?.kind==='V2')return 0;if(m?.kind==='V3')return 1;if(m?.kind==='AERO_V2')return 2;if(m?.kind==='AERO_CL')return 3;throw Error('unsupported adapter')}
 function leg(m,tin,tout){if(!m||!addr(m.pair)||!addr(tin)||!addr(tout))throw Error('invalid leg');return{kind:kind(m),venue:Number(m.venue||0),pair:m.pair,tokenIn:tin,tokenOut:tout,fee:Number(m.fee||0),tickSpacing:Number(m.tickSpacing||0),stable:Boolean(m.stable),minOut:BigInt(m.minOutRaw)}}
 function txData(route,exact,minProfitRaw,deadline){const plan={quoteToken:route.quoteAddress,borrow:BigInt(exact.borrowRaw),minProfit:minProfitRaw,deadline:BigInt(deadline),buy:leg(exact.buyMeta,route.quoteAddress,route.assetAddress),sell:leg(exact.sellMeta,route.assetAddress,route.quoteAddress)};return encodeFunctionData({abi:receiverAbi,functionName:'executeArbitrage',args:[plan]})}
-async function receiverState(receiver,from,borrow){const code=await rpc('eth_getCode',[receiver,'latest']);if(!code||code==='0x')throw Error('receiver has no bytecode');const hash='0x'+createHash('sha256').update(String(code).toLowerCase()).digest('hex');if(norm(hash)!==norm(APPROVED_RUNTIME))throw Error('receiver runtime mismatch');const[owner,paused,maxBorrow,quote,aave,uv3,aero]=await Promise.all([call(receiver,viewAbi,'owner'),call(receiver,viewAbi,'paused'),call(receiver,viewAbi,'maxBorrowRaw'),call(receiver,viewAbi,'authorizedQuote'),call(receiver,viewAbi,'aavePool'),call(receiver,viewAbi,'uniV3Factory'),call(receiver,viewAbi,'aeroClFactory')]);if(norm(owner)!==norm(from))throw Error('receiver owner mismatch');if(paused)throw Error('receiver paused');if(BigInt(maxBorrow)<borrow)throw Error('receiver cap below route size');if(norm(quote)!==norm(USDC)||norm(aave)!==norm(AAVE)||norm(uv3)!==norm(UNI3F)||norm(aero)!==norm(AEROCLF))throw Error('receiver constants mismatch');return hash}
+async function receiverState(receiver,from,borrow){
+  const code=await rpc('eth_getCode',[receiver,'latest']);if(!code||code==='0x')throw Error('receiver has no bytecode');const hash='0x'+createHash('sha256').update(String(code).toLowerCase()).digest('hex');if(norm(hash)!==norm(APPROVED_RUNTIME))throw Error('receiver runtime mismatch');
+  const names=['owner','paused','maxBorrowRaw','authorizedQuote','aavePool','uniV2Router','sushiV2Router','uniV3Factory','uniV3Router','aeroFactoryRegistry','aeroClassicFactory','aeroClassicRouter','aeroClFactory','aeroClRouter'];const vals=await Promise.all(names.map(n=>call(receiver,viewAbi,n)));
+  const [owner,paused,maxBorrow,quote,aave,uv2,sv2,uv3f,uv3r,areg,aclf,aclr,aclF,aclR]=vals;
+  if(norm(owner)!==norm(from))throw Error('receiver owner mismatch');if(paused)throw Error('receiver paused');if(BigInt(maxBorrow)<borrow)throw Error('receiver cap below route size');
+  const expected=[[quote,USDC,'authorizedQuote'],[aave,AAVE,'aavePool'],[uv2,UNI_V2_ROUTER,'uniV2Router'],[sv2,SUSHI_V2_ROUTER,'sushiV2Router'],[uv3f,UNI_V3_FACTORY,'uniV3Factory'],[uv3r,UNI_V3_ROUTER,'uniV3Router'],[areg,AERO_REGISTRY,'aeroFactoryRegistry'],[aclf,AERO_CLASSIC_FACTORY,'aeroClassicFactory'],[aclr,AERO_CLASSIC_ROUTER,'aeroClassicRouter'],[aclF,AERO_CL_FACTORY,'aeroClFactory'],[aclR,AERO_CL_ROUTER,'aeroClRouter']];
+  for(const[x,y,label]of expected)if(norm(x)!==norm(y))throw Error(label+' mismatch');return hash;
+}
 async function estimateFees(data,gas){const gasPrice=BigInt(await rpc('eth_gasPrice',[])),size=BigInt(Math.ceil((data.length-2)/2)+220);let l1=0n,op=0n;try{l1=BigInt(await call(GPO,feeAbi,'getL1FeeUpperBound',[size]))}catch{}try{op=BigInt(await call(GPO,feeAbi,'getOperatorFee',[gas]))}catch{}const total=gas*gasPrice+l1+op,px=await ethUsd();return{gasPriceWei:gasPrice.toString(),gasUnits:gas.toString(),l1FeeWei:l1.toString(),operatorFeeWei:op.toString(),totalGasWei:total.toString(),ethUsd:px,gasUsd:Number(total)/1e18*px}}
 
 export async function prepareLive(b){
-  const route=b?.route,receiver=b?.receiver,from=b?.from;
-  if(!route||route.chainKey!=='base'||route.chainId!==8453)throw Error('Base execution only');
-  if(!addr(receiver)||!addr(from)||!addr(route.quoteAddress)||!addr(route.assetAddress)||norm(route.quoteAddress)!==norm(USDC))throw Error('invalid Base USDC execution request');
-  const fresh=await exactBase(route);
-  if(fresh?.stage!=='EXACT_PASS'||fresh?.exact?.status!=='PASS')throw Error('fresh server EXACT_PASS required');
-  const exact=fresh.exact;
-  const borrow=BigInt(exact.borrowRaw),baseThreshold=borrow*5n/10000n>10000000n?borrow*5n/10000n:10000000n;
-  if(borrow<1000000000n||borrow>250000000000n)throw Error('borrow outside policy');
-  const runtimeHash=await receiverState(receiver,from,borrow);
-  const head=BigInt(await rpc('eth_blockNumber',[])),proofBlock=BigInt(fresh.blockNumber||0);
-  if(!proofBlock||head>proofBlock+2n)throw Error('fresh exact moved more than 2 blocks; retry');
-  const deadline=Math.floor(Date.now()/1000)+75;
-  let required=baseThreshold,data=txData(route,exact,required,deadline),gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],6500)),fees=await estimateFees(data,gas);
-  required=baseThreshold+BigInt(Math.ceil((fees.gasUsd+.35)*1e6));
-  data=txData(route,exact,required,deadline);
-  await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);
-  gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));
-  fees=await estimateFees(data,gas);
-  const required2=baseThreshold+BigInt(Math.ceil((fees.gasUsd+.35)*1e6));
-  if(required2!==required){required=required2;data=txData(route,exact,required,deadline);await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));fees=await estimateFees(data,gas)}
-  const thresholdUsd=Number(baseThreshold)/1e6,minimumPostGasProfitUsd=Number(required)/1e6-fees.gasUsd;
-  if(minimumPostGasProfitUsd<thresholdUsd)throw Error('post-gas profit gate failed');
-  return{ready:true,chainId:8453,receiver,deadline,proofBlock:Number(proofBlock),currentBlock:Number(head),thresholdUsd,requiredPreGasProfitUsd:Number(required)/1e6,minimumPostGasProfitUsd,expectedPostGasProfitUsd:fresh.exact.netBeforeGas-fees.gasUsd,gas:fees,transaction:{to:receiver,data,value:'0x0',gas:'0x'+gas.toString(16)},freshExact:{...fresh,proofSource:'server'},runtimeHash,rpcPolicy:'PublicNode + Base public + LlamaRPC · cooldown/failover · 1RPC removed',proofSummary:{freshServerExact:true,receiverRuntime:true,receiverConstants:true,liveEthCall:true,liveEstimateGas:true,protectedGasCap:true,postGasGate:true}};
+  const route=b?.route,receiver=b?.receiver,from=b?.from;if(!route||route.chainKey!=='base'||route.chainId!==8453)throw Error('Base execution only');if(!addr(receiver)||!addr(from)||!addr(route.quoteAddress)||!addr(route.assetAddress)||norm(route.quoteAddress)!==norm(USDC))throw Error('invalid Base USDC execution request');
+  const fresh=await exactBase(route);if(fresh?.stage!=='EXACT_PASS'||fresh?.exact?.status!=='PASS')throw Error('fresh server EXACT_PASS required');const exact=fresh.exact,borrow=BigInt(exact.borrowRaw),baseThreshold=borrow*5n/10000n>10000000n?borrow*5n/10000n:10000000n;if(borrow<1000000000n||borrow>250000000000n)throw Error('borrow outside policy');
+  const runtimeHash=await receiverState(receiver,from,borrow),head=BigInt(await rpc('eth_blockNumber',[])),proofBlock=BigInt(fresh.blockNumber||0);if(!proofBlock||head>proofBlock+2n)throw Error('fresh exact moved more than 2 blocks; retry');const deadline=Math.floor(Date.now()/1000)+75;
+  let required=baseThreshold,data=txData(route,exact,required,deadline),gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],6500)),fees=await estimateFees(data,gas);required=baseThreshold+BigInt(Math.ceil((fees.gasUsd+.35)*1e6));data=txData(route,exact,required,deadline);await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));fees=await estimateFees(data,gas);const required2=baseThreshold+BigInt(Math.ceil((fees.gasUsd+.35)*1e6));if(required2!==required){required=required2;data=txData(route,exact,required,deadline);await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));fees=await estimateFees(data,gas)}
+  const thresholdUsd=Number(baseThreshold)/1e6,minimumPostGasProfitUsd=Number(required)/1e6-fees.gasUsd;if(minimumPostGasProfitUsd<thresholdUsd)throw Error('post-gas profit gate failed');return{ready:true,chainId:8453,receiver,deadline,proofBlock:Number(proofBlock),currentBlock:Number(head),thresholdUsd,requiredPreGasProfitUsd:Number(required)/1e6,minimumPostGasProfitUsd,expectedPostGasProfitUsd:fresh.exact.netBeforeGas-fees.gasUsd,gas:fees,transaction:{to:receiver,data,value:'0x0',gas:'0x'+gas.toString(16)},freshExact:{...fresh,proofSource:'server'},runtimeHash,rpcPolicy:'PublicNode + Base public + LlamaRPC · circuit-breaker · 1RPC removed',proofSummary:{freshServerExact:true,receiverRuntime:true,receiverConstants:true,liveEthCall:true,liveEstimateGas:true,protectedGasCap:true,postGasGate:true}};
 }
-
-export default async function handler(req,res){if(req.method!=='POST')return res.status(405).json({error:'method_not_allowed'});try{return res.status(200).json(await prepareLive(req.body||{}))}catch(e){console.error('prepare-v94',e);return res.status(409).json({ready:false,error:'prepare_failed',message:String(e?.message||e).slice(0,500)})}}
+export default async function handler(req,res){if(req.method!=='POST')return res.status(405).json({error:'method_not_allowed'});try{return res.status(200).json(await prepareLive(req.body||{}))}catch(e){console.error('prepare-v941',e);return res.status(409).json({ready:false,error:'prepare_failed',message:String(e?.message||e).slice(0,500)})}}
