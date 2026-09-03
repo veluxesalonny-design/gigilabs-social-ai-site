@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { encodeFunctionData, decodeFunctionResult, parseAbi } from 'viem';
 import { exactBase } from './exact.js';
 
-const RPCS=['https://base-rpc.publicnode.com','https://mainnet.base.org','https://base.llamarpc.com','https://1rpc.io/base'];
+const RPCS=['https://base-rpc.publicnode.com','https://mainnet.base.org','https://base.llamarpc.com'];
 const APPROVED_RUNTIME='0x370c586265de600f83c972751bc334e493b07fe33ee100f84fb710763d732cad';
 const USDC='0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const AAVE='0xA238Dd80C259a72e81d7e4664a9801593F98d1c5';
@@ -13,13 +13,28 @@ const WETH='0x4200000000000000000000000000000000000006';
 const norm=x=>String(x||'').toLowerCase();
 const addr=x=>/^0x[0-9a-fA-F]{40}$/.test(String(x||''));
 const num=x=>Number.isFinite(Number(x))?Number(x):0;
+let rpcCursor=0;
 
 const receiverAbi=[{type:'function',name:'executeArbitrage',stateMutability:'nonpayable',inputs:[{name:'p',type:'tuple',components:[{name:'quoteToken',type:'address'},{name:'borrow',type:'uint256'},{name:'minProfit',type:'uint256'},{name:'deadline',type:'uint64'},{name:'buy',type:'tuple',components:[{name:'kind',type:'uint8'},{name:'venue',type:'uint8'},{name:'pair',type:'address'},{name:'tokenIn',type:'address'},{name:'tokenOut',type:'address'},{name:'fee',type:'uint24'},{name:'tickSpacing',type:'int24'},{name:'stable',type:'bool'},{name:'minOut',type:'uint256'}]},{name:'sell',type:'tuple',components:[{name:'kind',type:'uint8'},{name:'venue',type:'uint8'},{name:'pair',type:'address'},{name:'tokenIn',type:'address'},{name:'tokenOut',type:'address'},{name:'fee',type:'uint24'},{name:'tickSpacing',type:'int24'},{name:'stable',type:'bool'},{name:'minOut',type:'uint256'}]}]}],outputs:[]}];
 const viewAbi=parseAbi(['function owner() view returns(address)','function paused() view returns(bool)','function maxBorrowRaw() view returns(uint256)','function authorizedQuote() view returns(address)','function aavePool() view returns(address)','function uniV3Factory() view returns(address)','function aeroClFactory() view returns(address)']);
 const feeAbi=parseAbi(['function getL1FeeUpperBound(uint256) view returns(uint256)','function getOperatorFee(uint256) view returns(uint256)']);
 
-async function one(url,method,params,ms=3000){const c=new AbortController(),t=setTimeout(()=>c.abort(),ms);try{const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});const d=await r.json();if(!r.ok||d.error||d.result==null)throw Error(d.error?.message||'RPC');return d.result}finally{clearTimeout(t)}}
-async function rpc(method,params=[],ms=3500){try{return await Promise.any(RPCS.map(u=>one(u,method,params,ms)))}catch{throw Error('Base RPC unavailable')}}
+async function rpc(method,params=[],ms=3800){
+  let last='Base RPC unavailable';
+  const start=rpcCursor++%RPCS.length;
+  for(let i=0;i<RPCS.length;i++){
+    const url=RPCS[(start+i)%RPCS.length];
+    const c=new AbortController();
+    const t=setTimeout(()=>c.abort(),ms);
+    try{
+      const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
+      const d=await r.json();
+      if(r.ok&&!d.error&&d.result!=null)return d.result;
+      last=d.error?.message||`HTTP ${r.status}`;
+    }catch(e){last=e?.message||String(e)}finally{clearTimeout(t)}
+  }
+  throw Error(last);
+}
 async function call(to,abi,functionName,args=[]){const data=encodeFunctionData({abi,functionName,args}),r=await rpc('eth_call',[{to,data},'latest']);return decodeFunctionResult({abi,functionName,data:r})}
 async function ethUsd(){const c=new AbortController(),t=setTimeout(()=>c.abort(),3000);try{const r=await fetch('https://api.dexscreener.com/token-pairs/v1/base/'+WETH,{signal:c.signal,headers:{accept:'application/json'}});if(!r.ok)throw Error('price');const a=await r.json(),p=a.filter(x=>num(x.priceUsd)>0).sort((x,y)=>num(y.liquidity?.usd)-num(x.liquidity?.usd))[0];if(!p)throw Error('price');return num(p.priceUsd)}catch{return 10000}finally{clearTimeout(t)}}
 function kind(m){if(m?.kind==='V2')return 0;if(m?.kind==='V3')return 1;if(m?.kind==='AERO_V2')return 2;if(m?.kind==='AERO_CL')return 3;throw Error('unsupported adapter')}
@@ -35,7 +50,6 @@ export async function prepareLive(b){
   const fresh=await exactBase(route);
   if(fresh?.stage!=='EXACT_PASS'||fresh?.exact?.status!=='PASS')throw Error('fresh server EXACT_PASS required');
   const exact=fresh.exact;
-  if(['AERO_CL_LEGACY','AERO_CL_CAPS'].includes(exact.buyMeta.kind)||['AERO_CL_LEGACY','AERO_CL_CAPS'].includes(exact.sellMeta.kind))throw Error('legacy/intermediate Slipstream blocked');
   const borrow=BigInt(exact.borrowRaw),baseThreshold=borrow*5n/10000n>10000000n?borrow*5n/10000n:10000000n;
   if(borrow<1000000000n||borrow>250000000000n)throw Error('borrow outside policy');
   const runtimeHash=await receiverState(receiver,from,borrow);
@@ -43,12 +57,16 @@ export async function prepareLive(b){
   if(!proofBlock||head>proofBlock+2n)throw Error('fresh exact moved more than 2 blocks; retry');
   const deadline=Math.floor(Date.now()/1000)+75;
   let required=baseThreshold,data=txData(route,exact,required,deadline),gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],6500)),fees=await estimateFees(data,gas);
-  required=baseThreshold+BigInt(Math.ceil((fees.gasUsd+.35)*1e6));data=txData(route,exact,required,deadline);
-  await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));fees=await estimateFees(data,gas);
-  const required2=baseThreshold+BigInt(Math.ceil((fees.gasUsd+.35)*1e6));if(required2!==required){required=required2;data=txData(route,exact,required,deadline);await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));fees=await estimateFees(data,gas)}
+  required=baseThreshold+BigInt(Math.ceil((fees.gasUsd+.35)*1e6));
+  data=txData(route,exact,required,deadline);
+  await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);
+  gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));
+  fees=await estimateFees(data,gas);
+  const required2=baseThreshold+BigInt(Math.ceil((fees.gasUsd+.35)*1e6));
+  if(required2!==required){required=required2;data=txData(route,exact,required,deadline);await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));fees=await estimateFees(data,gas)}
   const thresholdUsd=Number(baseThreshold)/1e6,minimumPostGasProfitUsd=Number(required)/1e6-fees.gasUsd;
   if(minimumPostGasProfitUsd<thresholdUsd)throw Error('post-gas profit gate failed');
-  return{ready:true,chainId:8453,receiver,deadline,proofBlock:Number(proofBlock),currentBlock:Number(head),thresholdUsd,requiredPreGasProfitUsd:Number(required)/1e6,minimumPostGasProfitUsd,gas:fees,transaction:{to:receiver,data,value:'0x0',gas:'0x'+gas.toString(16)},freshExact:{...fresh,proofSource:'server'},runtimeHash,proofSummary:{freshServerExact:true,receiverRuntime:true,receiverConstants:true,liveEthCall:true,liveEstimateGas:true,protectedGasCap:true,postGasGate:true}};
+  return{ready:true,chainId:8453,receiver,deadline,proofBlock:Number(proofBlock),currentBlock:Number(head),thresholdUsd,requiredPreGasProfitUsd:Number(required)/1e6,minimumPostGasProfitUsd,expectedPostGasProfitUsd:fresh.exact.netBeforeGas-fees.gasUsd,gas:fees,transaction:{to:receiver,data,value:'0x0',gas:'0x'+gas.toString(16)},freshExact:{...fresh,proofSource:'server'},runtimeHash,rpcPolicy:'PublicNode + Base public + LlamaRPC (1RPC removed)',proofSummary:{freshServerExact:true,receiverRuntime:true,receiverConstants:true,liveEthCall:true,liveEstimateGas:true,protectedGasCap:true,postGasGate:true}};
 }
 
-export default async function handler(req,res){if(req.method!=='POST')return res.status(405).json({error:'method_not_allowed'});try{return res.status(200).json(await prepareLive(req.body||{}))}catch(e){console.error('prepare-v93',e);return res.status(409).json({ready:false,error:'prepare_failed',message:String(e?.message||e).slice(0,500)})}}
+export default async function handler(req,res){if(req.method!=='POST')return res.status(405).json({error:'method_not_allowed'});try{return res.status(200).json(await prepareLive(req.body||{}))}catch(e){console.error('prepare-v94',e);return res.status(409).json({ready:false,error:'prepare_failed',message:String(e?.message||e).slice(0,500)})}}
