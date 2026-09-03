@@ -22,7 +22,8 @@ const rpcState=RPCS.map(url=>({url,cooldownUntil:0,fails:0}));
 let rpcCursor=0;
 let screenCache={at:0,pairs:null};
 
-function ok(res,data,status=200){res.status(status).json(data)}
+function jsonSafe(data){return JSON.parse(JSON.stringify(data,(_k,v)=>typeof v==='bigint'?v.toString():v))}
+function ok(res,data,status=200){res.status(status).json(jsonSafe(data))}
 function fail(res,message,status=500){res.status(status).json({ok:false,error:String(message)})}
 function norm(x){return String(x||'').toLowerCase()}
 function validAddress(x){return /^0x[0-9a-fA-F]{40}$/.test(String(x||''))}
