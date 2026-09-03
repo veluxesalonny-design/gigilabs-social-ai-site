@@ -14,6 +14,7 @@ const norm=x=>String(x||'').toLowerCase();
 const addr=x=>/^0x[0-9a-fA-F]{40}$/.test(String(x||''));
 const num=x=>Number.isFinite(Number(x))?Number(x):0;
 let rpcCursor=0;
+const rpcState=RPCS.map(()=>({coolUntil:0,failures:0}));
 
 const receiverAbi=[{type:'function',name:'executeArbitrage',stateMutability:'nonpayable',inputs:[{name:'p',type:'tuple',components:[{name:'quoteToken',type:'address'},{name:'borrow',type:'uint256'},{name:'minProfit',type:'uint256'},{name:'deadline',type:'uint64'},{name:'buy',type:'tuple',components:[{name:'kind',type:'uint8'},{name:'venue',type:'uint8'},{name:'pair',type:'address'},{name:'tokenIn',type:'address'},{name:'tokenOut',type:'address'},{name:'fee',type:'uint24'},{name:'tickSpacing',type:'int24'},{name:'stable',type:'bool'},{name:'minOut',type:'uint256'}]},{name:'sell',type:'tuple',components:[{name:'kind',type:'uint8'},{name:'venue',type:'uint8'},{name:'pair',type:'address'},{name:'tokenIn',type:'address'},{name:'tokenOut',type:'address'},{name:'fee',type:'uint24'},{name:'tickSpacing',type:'int24'},{name:'stable',type:'bool'},{name:'minOut',type:'uint256'}]}]}],outputs:[]}];
 const viewAbi=parseAbi(['function owner() view returns(address)','function paused() view returns(bool)','function maxBorrowRaw() view returns(uint256)','function authorizedQuote() view returns(address)','function aavePool() view returns(address)','function uniV3Factory() view returns(address)','function aeroClFactory() view returns(address)']);
@@ -21,17 +22,19 @@ const feeAbi=parseAbi(['function getL1FeeUpperBound(uint256) view returns(uint25
 
 async function rpc(method,params=[],ms=3800){
   let last='Base RPC unavailable';
-  const start=rpcCursor++%RPCS.length;
-  for(let i=0;i<RPCS.length;i++){
-    const url=RPCS[(start+i)%RPCS.length];
-    const c=new AbortController();
-    const t=setTimeout(()=>c.abort(),ms);
-    try{
-      const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
-      const d=await r.json();
-      if(r.ok&&!d.error&&d.result!=null)return d.result;
-      last=d.error?.message||`HTTP ${r.status}`;
-    }catch(e){last=e?.message||String(e)}finally{clearTimeout(t)}
+  const now=Date.now(),start=rpcCursor++%RPCS.length;
+  for(let pass=0;pass<2;pass++){
+    for(let i=0;i<RPCS.length;i++){
+      const idx=(start+i)%RPCS.length,state=rpcState[idx];if(pass===0&&state.coolUntil>now)continue;
+      const url=RPCS[idx],c=new AbortController(),t=setTimeout(()=>c.abort(),ms);
+      try{
+        const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
+        const text=await r.text();let d=null;try{d=JSON.parse(text)}catch{}
+        if(r.ok&&d&&!d.error&&d.result!=null){state.failures=0;state.coolUntil=0;return d.result}
+        const msg=d?.error?.message||text.slice(0,180)||`HTTP ${r.status}`;last=msg;state.failures++;
+        if(r.status===429||/rate limit|over rate|usage limit|forbidden|too many|<!doctype|<html/i.test(msg))state.coolUntil=Date.now()+Math.min(60000,12000*state.failures);
+      }catch(e){last=e?.message||String(e);state.failures++;state.coolUntil=Date.now()+Math.min(30000,5000*state.failures)}finally{clearTimeout(t)}
+    }
   }
   throw Error(last);
 }
@@ -66,7 +69,7 @@ export async function prepareLive(b){
   if(required2!==required){required=required2;data=txData(route,exact,required,deadline);await rpc('eth_call',[{from,to:receiver,data,value:'0x0'},'latest'],8500);gas=BigInt(await rpc('eth_estimateGas',[{from,to:receiver,data,value:'0x0'}],8500));fees=await estimateFees(data,gas)}
   const thresholdUsd=Number(baseThreshold)/1e6,minimumPostGasProfitUsd=Number(required)/1e6-fees.gasUsd;
   if(minimumPostGasProfitUsd<thresholdUsd)throw Error('post-gas profit gate failed');
-  return{ready:true,chainId:8453,receiver,deadline,proofBlock:Number(proofBlock),currentBlock:Number(head),thresholdUsd,requiredPreGasProfitUsd:Number(required)/1e6,minimumPostGasProfitUsd,expectedPostGasProfitUsd:fresh.exact.netBeforeGas-fees.gasUsd,gas:fees,transaction:{to:receiver,data,value:'0x0',gas:'0x'+gas.toString(16)},freshExact:{...fresh,proofSource:'server'},runtimeHash,rpcPolicy:'PublicNode + Base public + LlamaRPC (1RPC removed)',proofSummary:{freshServerExact:true,receiverRuntime:true,receiverConstants:true,liveEthCall:true,liveEstimateGas:true,protectedGasCap:true,postGasGate:true}};
+  return{ready:true,chainId:8453,receiver,deadline,proofBlock:Number(proofBlock),currentBlock:Number(head),thresholdUsd,requiredPreGasProfitUsd:Number(required)/1e6,minimumPostGasProfitUsd,expectedPostGasProfitUsd:fresh.exact.netBeforeGas-fees.gasUsd,gas:fees,transaction:{to:receiver,data,value:'0x0',gas:'0x'+gas.toString(16)},freshExact:{...fresh,proofSource:'server'},runtimeHash,rpcPolicy:'PublicNode + Base public + LlamaRPC · cooldown/failover · 1RPC removed',proofSummary:{freshServerExact:true,receiverRuntime:true,receiverConstants:true,liveEthCall:true,liveEstimateGas:true,protectedGasCap:true,postGasGate:true}};
 }
 
 export default async function handler(req,res){if(req.method!=='POST')return res.status(405).json({error:'method_not_allowed'});try{return res.status(200).json(await prepareLive(req.body||{}))}catch(e){console.error('prepare-v94',e);return res.status(409).json({ready:false,error:'prepare_failed',message:String(e?.message||e).slice(0,500)})}}
