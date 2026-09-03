@@ -36,8 +36,7 @@ async function rpc(method,params=[]){
   const now=Date.now(),start=rpcCursor++%rpcState.length;
   let order=Array.from({length:rpcState.length},(_,i)=>rpcState[(start+i)%rpcState.length]);
   const live=order.filter(s=>s.cooldownUntil<=now);
-  if(live.length)order=live;
-  else order.sort((a,b)=>a.cooldownUntil-b.cooldownUntil);
+  if(live.length)order=live;else order.sort((a,b)=>a.cooldownUntil-b.cooldownUntil);
   for(const s of order){
     const c=new AbortController(),t=setTimeout(()=>c.abort(),3800);
     try{
@@ -55,13 +54,18 @@ async function latestBlock(){return Number(BigInt(await rpc('eth_blockNumber',[]
 
 async function fetchScreenPairs(){
   if(screenCache.pairs&&Date.now()-screenCache.at<4500)return screenCache.pairs;
-  const addresses=ASSETS.map(a=>a.address).join(','),c=new AbortController(),t=setTimeout(()=>c.abort(),4500);
-  try{
-    const r=await fetch('https://api.dexscreener.com/tokens/v1/base/'+addresses,{headers:{accept:'application/json'},signal:c.signal});
-    if(!r.ok)throw Error('screen feed HTTP '+r.status);
-    const pairs=await r.json();if(!Array.isArray(pairs))throw Error('screen feed malformed');
-    screenCache={at:Date.now(),pairs};return pairs;
-  }finally{clearTimeout(t)}
+  const sets=await mapLimit(ASSETS,3,async asset=>{
+    const c=new AbortController(),t=setTimeout(()=>c.abort(),3500);
+    try{
+      const r=await fetch('https://api.dexscreener.com/token-pairs/v1/base/'+asset.address,{headers:{accept:'application/json'},signal:c.signal});
+      if(!r.ok)throw Error('screen feed HTTP '+r.status);
+      const a=await r.json();return Array.isArray(a)?a:[];
+    }finally{clearTimeout(t)}
+  });
+  const dedup=new Map();
+  for(const arr of sets.filter(Boolean))for(const p of arr||[]){const k=[norm(p?.dexId),norm(p?.pairAddress)].join(':');if(p?.pairAddress&&!dedup.has(k))dedup.set(k,p)}
+  const pairs=[...dedup.values()];
+  screenCache={at:Date.now(),pairs};return pairs;
 }
 function orientPair(p,asset){
   if(!p?.pairAddress||norm(p.chainId)!=='base'||!dexName(p.dexId))return null;
@@ -99,10 +103,7 @@ function buildScreenRoutes(pairs,cap){
 }
 async function exactRoute(route,budget){
   const sizes=(route.sizeCandidates||[route.borrowUsd]).slice(0,budget),tests=[];
-  for(const size of sizes){
-    const env=await exactBase({...route,optimalBorrow:size,borrowUsd:size,b:size,gas:.75});
-    tests.push({...env,_size:size});
-  }
+  for(const size of sizes){const env=await exactBase({...route,optimalBorrow:size,borrowUsd:size,b:size,gas:.75});tests.push({...env,_size:size})}
   const ranked=tests.slice().sort((a,b)=>(b.exact?.netAfterGas??-Infinity)-(a.exact?.netAfterGas??-Infinity));
   const best=ranked.find(x=>x.stage==='EXACT_PASS'&&x.exact?.status==='PASS')||ranked[0]||{stage:'UNAVAILABLE',exact:{status:'BLOCKED',reason:'no exact result'}};
   return{...best,proofSource:'server',selectedBorrowUsd:best._size,exactAt:best.exactAt||Date.now(),testedSizes:tests.map(x=>({borrowUsd:x._size,stage:x.stage,netAfterGas:x.exact?.netAfterGas??null}))};
@@ -111,16 +112,10 @@ async function scan(cap){
   const started=Date.now(),blockNumber=await latestBlock(),pairs=await fetchScreenPairs(),allRoutes=buildScreenRoutes(pairs,cap),visible=allRoutes.slice(0,12),targets=visible.slice(0,5);
   const exacts=await mapLimit(targets,2,(r,i)=>exactRoute(r,i<3?3:2));
   const exactById=new Map(targets.map((r,i)=>[r.id,exacts[i]]));
-  let candidates=visible.map(r=>{
-    const e=exactById.get(r.id)||{stage:'SCREEN_ONLY',proofSource:'screen',exact:{status:'BLOCKED',reason:'exact budget reserved for higher-ranked routes this block'}};
-    const selected=Number(e.selectedBorrowUsd||r.borrowUsd);return{...r,blockNumber,borrowUsd:selected,b:selected,optimalBorrow:selected,exactEnvelope:e};
-  });
-  candidates.sort((a,b)=>{
-    const ap=a.exactEnvelope?.stage==='EXACT_PASS'?1:0,bp=b.exactEnvelope?.stage==='EXACT_PASS'?1:0;if(bp!==ap)return bp-ap;
-    const an=a.exactEnvelope?.exact?.netAfterGas??-Infinity,bn=b.exactEnvelope?.exact?.netAfterGas??-Infinity;if(bn!==an)return bn-an;return b.screenNet-a.screenNet;
-  });
+  let candidates=visible.map(r=>{const e=exactById.get(r.id)||{stage:'SCREEN_ONLY',proofSource:'screen',exact:{status:'BLOCKED',reason:'exact budget reserved for higher-ranked routes this block'}};const selected=Number(e.selectedBorrowUsd||r.borrowUsd);return{...r,blockNumber,borrowUsd:selected,b:selected,optimalBorrow:selected,exactEnvelope:e}});
+  candidates.sort((a,b)=>{const ap=a.exactEnvelope?.stage==='EXACT_PASS'?1:0,bp=b.exactEnvelope?.stage==='EXACT_PASS'?1:0;if(bp!==ap)return bp-ap;const an=a.exactEnvelope?.exact?.netAfterGas??-Infinity,bn=b.exactEnvelope?.exact?.netAfterGas??-Infinity;if(bn!==an)return bn-an;return b.screenNet-a.screenNet});
   const exactPasses=candidates.filter(c=>c.exactEnvelope?.stage==='EXACT_PASS'&&c.exactEnvelope?.exact?.status==='PASS').length;
-  return{ok:true,engine:'Flash Edge V9.4.1',mode:'rate-safe screen → bounded on-chain exact → live prepare',rpcPolicy:RPC_LABEL,blockNumber,latencyMs:Date.now()-started,assets:ASSETS.length,venues:3,searchCapUsd:cap,screenPairs:pairs.length,screenRouteCount:allRoutes.length,candidateCount:candidates.length,sameDexCandidates:candidates.filter(c=>c.sameDex).length,exactChecks:exacts.reduce((n,e)=>n+(e?.testedSizes?.length||0),0),exactPasses,candidates};
+  return{ok:true,engine:'Flash Edge V9.4.2',mode:'broad off-chain screen → bounded on-chain exact → live prepare',rpcPolicy:RPC_LABEL,blockNumber,latencyMs:Date.now()-started,assets:ASSETS.length,venues:3,searchCapUsd:cap,screenPairs:pairs.length,screenRouteCount:allRoutes.length,candidateCount:candidates.length,sameDexCandidates:candidates.filter(c=>c.sameDex).length,exactChecks:exacts.reduce((n,e)=>n+(e?.testedSizes?.length||0),0),exactPasses,candidates};
 }
 async function receiverCheck(receiver,owner){
   if(!validAddress(receiver)||!validAddress(owner))throw Error('invalid receiver or owner');
@@ -133,7 +128,7 @@ async function receiverCheck(receiver,owner){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||req.body?.action||'health');
-    if(action==='health')return ok(res,{ok:true,engine:'Flash Edge V9.4.1',mode:'rate-safe screen → bounded on-chain exact → live prepare',rpcPolicy:RPC_LABEL,assets:ASSETS.length,maxSearchUsd:250000});
+    if(action==='health')return ok(res,{ok:true,engine:'Flash Edge V9.4.2',mode:'broad off-chain screen → bounded on-chain exact → live prepare',rpcPolicy:RPC_LABEL,assets:ASSETS.length,maxSearchUsd:250000});
     if(action==='block')return ok(res,{ok:true,blockNumber:await latestBlock(),serverTime:Date.now(),rpcPolicy:RPC_LABEL});
     if(action==='scan')return ok(res,await scan(Math.min(250000,Math.max(1000,Number(req.body?.cap)||250000))));
     if(action==='receiver')return ok(res,await receiverCheck(String(req.body?.receiver||''),String(req.body?.owner||'')));
@@ -148,5 +143,5 @@ export default async function handler(req,res){
       return ok(res,{ok:true,result:await rpc(method,Array.isArray(req.body?.params)?req.body.params:[])});
     }
     return fail(res,'unknown action',404);
-  }catch(e){console.error('v941-engine',e);return fail(res,e?.message||String(e),503)}
+  }catch(e){console.error('v942-engine',e);return fail(res,e?.message||String(e),503)}
 }
