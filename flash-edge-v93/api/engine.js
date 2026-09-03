@@ -6,7 +6,7 @@ import { prepareLive } from './prepare.js';
 const USDC='0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const APPROVED_RUNTIME='0x370c586265de600f83c972751bc334e493b07fe33ee100f84fb710763d732cad';
 const RPCS=['https://base-rpc.publicnode.com','https://mainnet.base.org','https://base.llamarpc.com'];
-const RPC_LABEL='PublicNode + Base public + LlamaRPC · cooldown/failover · 1RPC removed';
+const RPC_LABEL='PublicNode + Base public + LlamaRPC · circuit-breaker · 1RPC removed';
 const MASTER_SIZES=[1000,2500,5000,10000,25000,50000,75000,100000,150000,200000,250000];
 const ASSETS=[
   {symbol:'WETH',address:'0x4200000000000000000000000000000000000006'},
@@ -17,170 +17,136 @@ const ASSETS=[
   {symbol:'USDbC',address:'0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA'},
   {symbol:'EURC',address:'0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42'}
 ];
-const STABLES=new Set(['USDC','USDBC','USDC.E']);
 const RX=parseAbi(['function owner() view returns(address)','function paused() view returns(bool)','function maxBorrowRaw() view returns(uint256)']);
-
+const rpcState=RPCS.map(url=>({url,cooldownUntil:0,fails:0}));
 let rpcCursor=0;
-const rpcState=RPCS.map(()=>({coolUntil:0,failures:0}));
-let blockCache={at:0,value:0};
-const discoveryCache=new Map();
-const scanCache=new Map();
-const scanInflight=new Map();
+let screenCache={at:0,pairs:null};
 
 function ok(res,data,status=200){res.status(status).json(data)}
 function fail(res,message,status=500){res.status(status).json({ok:false,error:String(message)})}
-function validAddress(x){return /^0x[0-9a-fA-F]{40}$/.test(String(x||''))}
 function norm(x){return String(x||'').toLowerCase()}
-function routeKey(r){return [r.assetSymbol,norm(r.buyPair),norm(r.sellPair)].join(':')}
-function dexName(id){id=norm(id);return id.includes('aerodrome')?'Aerodrome':id.includes('uniswap')?'Uniswap':id.includes('sushi')?'Sushi':null}
-function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
-function minThreshold(size){return Math.max(10,Number(size)*.0005)}
+function validAddress(x){return /^0x[0-9a-fA-F]{40}$/.test(String(x||''))}
+function dexName(x){x=norm(x);return x.includes('aerodrome')?'Aerodrome':x.includes('uniswap')?'Uniswap':x.includes('sushi')?'Sushi':null}
+function isRate(status,msg){return status===429||/rate|limit|too many|over rate|quota/i.test(String(msg||''))}
+function routeKey(r){return [r.assetSymbol,norm(r.buyPair||r.buyMeta?.pair),norm(r.sellPair||r.sellMeta?.pair)].join(':')}
+async function mapLimit(items,limit,fn){const out=new Array(items.length);let next=0;async function worker(){while(true){const i=next++;if(i>=items.length)return;try{out[i]=await fn(items[i],i)}catch{out[i]=null}}}await Promise.all(Array.from({length:Math.min(limit,items.length)},()=>worker()));return out}
 
 async function rpc(method,params=[]){
   let last='Base RPC unavailable';
-  const now=Date.now(),start=rpcCursor++%RPCS.length;
-  let tried=0;
-  for(let pass=0;pass<2;pass++){
-    for(let i=0;i<RPCS.length;i++){
-      const idx=(start+i)%RPCS.length,state=rpcState[idx];
-      if(pass===0&&state.coolUntil>now)continue;
-      const url=RPCS[idx],c=new AbortController(),t=setTimeout(()=>c.abort(),4200);
-      tried++;
-      try{
-        const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
-        const text=await r.text();
-        let j=null;
-        try{j=JSON.parse(text)}catch{}
-        if(r.ok&&j&&!j.error&&j.result!==undefined){state.failures=0;state.coolUntil=0;return j.result}
-        const msg=j?.error?.message||text.slice(0,180)||`HTTP ${r.status}`;
-        last=msg;
-        state.failures++;
-        if(r.status===429||/rate limit|over rate|usage limit|forbidden|too many|<!doctype|<html/i.test(msg))state.coolUntil=Date.now()+Math.min(60000,12000*state.failures);
-      }catch(e){last=e?.message||String(e);state.failures++;state.coolUntil=Date.now()+Math.min(30000,5000*state.failures)}finally{clearTimeout(t)}
-    }
-    if(tried===0)await sleep(120);
+  const now=Date.now(),start=rpcCursor++%rpcState.length;
+  let order=Array.from({length:rpcState.length},(_,i)=>rpcState[(start+i)%rpcState.length]);
+  const live=order.filter(s=>s.cooldownUntil<=now);
+  if(live.length)order=live;
+  else order.sort((a,b)=>a.cooldownUntil-b.cooldownUntil);
+  for(const s of order){
+    const c=new AbortController(),t=setTimeout(()=>c.abort(),3800);
+    try{
+      const r=await fetch(s.url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
+      const text=await r.text();let j;try{j=JSON.parse(text)}catch{j={error:{message:text||`HTTP ${r.status}`}}}
+      if(r.ok&&!j.error&&j.result!==undefined){s.fails=0;s.cooldownUntil=0;return j.result}
+      last=j.error?.message||`HTTP ${r.status}`;s.fails++;
+      s.cooldownUntil=Date.now()+(isRate(r.status,last)?Math.min(90000,15000*s.fails):Math.min(10000,1500*s.fails));
+    }catch(e){last=e?.message||String(e);s.fails++;s.cooldownUntil=Date.now()+Math.min(10000,1500*s.fails)}finally{clearTimeout(t)}
   }
   throw Error(last);
 }
 async function call(to,data,block='latest'){return rpc('eth_call',[{to,data},block])}
-async function latestBlock(force=false){
-  if(!force&&blockCache.value&&Date.now()-blockCache.at<700)return blockCache.value;
-  const value=Number(BigInt(await rpc('eth_blockNumber',[])));
-  blockCache={at:Date.now(),value};
-  return value;
-}
-async function mapLimit(items,limit,fn){
-  const out=new Array(items.length);let next=0;
-  async function worker(){while(true){const i=next++;if(i>=items.length)return;try{out[i]=await fn(items[i],i)}catch{out[i]=null}}}
-  await Promise.all(Array.from({length:Math.min(limit,items.length)},()=>worker()));return out;
-}
+async function latestBlock(){return Number(BigInt(await rpc('eth_blockNumber',[])))}
 
-async function dexPairs(asset){
-  const cached=discoveryCache.get(asset.symbol);
-  if(cached&&Date.now()-cached.at<2500)return cached.value;
-  const c=new AbortController(),t=setTimeout(()=>c.abort(),3500);
+async function fetchScreenPairs(){
+  if(screenCache.pairs&&Date.now()-screenCache.at<4500)return screenCache.pairs;
+  const addresses=ASSETS.map(a=>a.address).join(','),c=new AbortController(),t=setTimeout(()=>c.abort(),4500);
   try{
-    const r=await fetch('https://api.dexscreener.com/token-pairs/v1/base/'+asset.address,{signal:c.signal,headers:{accept:'application/json'}});
-    if(!r.ok)throw Error('DEX discovery '+r.status);
-    const raw=await r.json(),value=(Array.isArray(raw)?raw:[]).map(x=>orientPair(x,asset)).filter(Boolean);
-    discoveryCache.set(asset.symbol,{at:Date.now(),value});return value;
+    const r=await fetch('https://api.dexscreener.com/tokens/v1/base/'+addresses,{headers:{accept:'application/json'},signal:c.signal});
+    if(!r.ok)throw Error('screen feed HTTP '+r.status);
+    const pairs=await r.json();if(!Array.isArray(pairs))throw Error('screen feed malformed');
+    screenCache={at:Date.now(),pairs};return pairs;
   }finally{clearTimeout(t)}
 }
-function orientPair(x,asset){
-  if(!x?.pairAddress||!validAddress(x.pairAddress)||!(Number(x?.liquidity?.usd)>0))return null;
-  const dex=dexName(x.dexId);if(!dex)return null;
-  const ba=norm(x.baseToken?.address),qa=norm(x.quoteToken?.address),aa=norm(asset.address),usdc=norm(USDC);
+function orientPair(p,asset){
+  if(!p?.pairAddress||norm(p.chainId)!=='base'||!dexName(p.dexId))return null;
+  const liq=Number(p?.liquidity?.usd||0);if(!(liq>=75000))return null;
+  const ba=norm(p.baseToken?.address),qa=norm(p.quoteToken?.address),aa=norm(asset.address),u=norm(USDC);
   let px=0;
-  if(ba===aa&&qa===usdc)px=Number(x.priceUsd);
-  else if(qa===aa&&ba===usdc){const baseUsd=Number(x.priceUsd),native=Number(x.priceNative);if(baseUsd>0&&native>0)px=baseUsd/native}
+  if(ba===aa&&qa===u)px=Number(p.priceUsd);
+  else if(ba===u&&qa===aa){const baseUsd=Number(p.priceUsd),native=Number(p.priceNative);if(baseUsd>0&&native>0)px=baseUsd/native}
   else return null;
   if(!(px>0))return null;
-  return{pair:x.pairAddress,dex,px,liq:Number(x.liquidity.usd)};
+  return{assetSymbol:asset.symbol,assetAddress:asset.address,pair:p.pairAddress,dex:dexName(p.dexId),px,liq,labels:p.labels||[]};
 }
 function modelNet(buyPx,sellPx,size,liq){
-  const gross=size*(sellPx/buyPx-1),flash=size*.0005,impact=size*Math.min(.015,(size/Math.max(liq,1))*.55),gas=.75;
-  return{net:gross-flash-impact-gas,gross,flash,impact,gas};
+  const gross=size*(sellPx/buyPx-1),flash=size*.0005,impact=size*Math.min(.008,(size/Math.max(liq,1))*.35),gas=.75;
+  return{gross,flash,impact,gas,net:gross-flash-impact-gas};
 }
-function bestModel(route,cap){
-  const max=Math.min(250000,cap,Math.max(1000,route.liq*.02));
-  const sizes=[...new Set([...MASTER_SIZES.filter(x=>x<=max),Math.round(max)])].filter(x=>x>=1000&&x<=max);
-  const curve=sizes.map(size=>({borrowUsd:size,...modelNet(route.buyPx,route.sellPx,size,route.liq)})).sort((a,b)=>b.net-a.net);
-  return{best:curve[0],curve};
-}
-async function discoverRoutes(cap){
-  const pairSets=(await mapLimit(ASSETS,3,async asset=>({asset,pairs:await dexPairs(asset)}))).filter(Boolean);
+function buildScreenRoutes(pairs,cap){
   const routes=[];
-  for(const {asset,pairs} of pairSets){
-    const p=pairs.filter(x=>x.liq>=50000);
-    for(const buy of p)for(const sell of p){
+  for(const asset of ASSETS){
+    const pools=pairs.map(p=>orientPair(p,asset)).filter(Boolean);
+    for(const buy of pools)for(const sell of pools){
       if(norm(buy.pair)===norm(sell.pair)||sell.px<=buy.px)continue;
-      const spreadBps=(sell.px/buy.px-1)*10000;if(spreadBps<2)continue;
-      const liq=Math.min(buy.liq,sell.liq),base={assetSymbol:asset.symbol,assetAddress:asset.address,buyDex:buy.dex,sellDex:sell.dex,buyPair:buy.pair,sellPair:sell.pair,buyPx:buy.px,sellPx:sell.px,liq,sameDex:buy.dex===sell.dex,spreadBps};
-      const m=bestModel(base,cap);if(!m.best)continue;
-      routes.push({...base,model:m.best,modelCurve:m.curve});
+      const spreadBps=(sell.px/buy.px-1)*10000;if(spreadBps<3)continue;
+      const liq=Math.min(buy.liq,sell.liq),max=Math.min(250000,cap,Math.max(0,liq*.01));if(max<1000)continue;
+      const ladder=[...new Set([...MASTER_SIZES.filter(x=>x<=max),Math.round(max/100)*100].filter(x=>x>=1000&&x<=max))].sort((a,b)=>a-b);
+      if(!ladder.length)continue;
+      const scored=ladder.map(size=>({size,...modelNet(buy.px,sell.px,size,liq)})).sort((a,b)=>b.net-a.net);
+      const best=scored[0];if(!best||best.net<-12)continue;
+      const sizeCandidates=scored.slice(0,3).map(x=>x.size);
+      routes.push({id:[asset.symbol,norm(buy.pair),norm(sell.pair)].join(':'),k:'base',chain:'Base',chainId:8453,assetSymbol:asset.symbol,assetAddress:asset.address,quoteSymbol:'USDC',quoteAddress:USDC,buyDex:buy.dex,sellDex:sell.dex,bd:buy.dex,sd:sell.dex,buyPair:buy.pair,sellPair:sell.pair,sameDex:buy.dex===sell.dex,spreadBps,liquidityUsd:liq,maxBorrowUsd:max,borrowUsd:best.size,b:best.size,optimalBorrow:best.size,screenNet:best.net,screenGross:best.gross,sizeCandidates,testedSizes:scored.map(x=>({borrowUsd:x.size,screenNet:x.net}))});
     }
   }
-  const dedup=new Map();
-  for(const r of routes){const k=routeKey(r),p=dedup.get(k);if(!p||r.model.net>p.model.net)dedup.set(k,r)}
-  return [...dedup.values()].sort((a,b)=>b.model.net-a.model.net).slice(0,18);
+  const dedup=new Map();for(const r of routes){const k=routeKey(r),p=dedup.get(k);if(!p||r.screenNet>p.screenNet)dedup.set(k,r)}
+  return [...dedup.values()].sort((a,b)=>b.screenNet-a.screenNet);
 }
-function candidateFromRoute(r,blockNumber){
-  const b=r.model.borrowUsd;
-  return{id:routeKey(r),k:'base',chain:'Base',chainId:8453,blockNumber,assetSymbol:r.assetSymbol,assetAddress:r.assetAddress,quoteSymbol:'USDC',quoteAddress:USDC,buyDex:r.buyDex,sellDex:r.sellDex,bd:r.buyDex,sd:r.sellDex,buyPair:r.buyPair,sellPair:r.sellPair,sameDex:r.sameDex,borrowUsd:b,b,optimalBorrow:b,screenNet:r.model.net,spreadBps:r.spreadBps,gas:.75,testedSizes:r.modelCurve.map(x=>({borrowUsd:x.borrowUsd,net:x.net}))};
-}
-async function exactCandidate(c,curve){
-  let best=await exactBase(c);
-  if(best?.stage==='EXACT_PASS')return best;
-  const n=Number(best?.exact?.netAfterGas);
-  if(Number.isFinite(n)&&n>-2){
-    const alt=curve.filter(x=>x.borrowUsd!==c.borrowUsd).sort((a,b)=>b.net-a.net)[0];
-    if(alt){const test={...c,borrowUsd:alt.borrowUsd,b:alt.borrowUsd,optimalBorrow:alt.borrowUsd};const second=await exactBase(test);if((second?.exact?.netAfterGas??-Infinity)>(best?.exact?.netAfterGas??-Infinity)){c.borrowUsd=alt.borrowUsd;c.b=alt.borrowUsd;c.optimalBorrow=alt.borrowUsd;best=second}}
+async function exactRoute(route,budget){
+  const sizes=(route.sizeCandidates||[route.borrowUsd]).slice(0,budget),tests=[];
+  for(const size of sizes){
+    const env=await exactBase({...route,optimalBorrow:size,borrowUsd:size,b:size,gas:.75});
+    tests.push({...env,_size:size});
   }
-  return best;
+  const ranked=tests.slice().sort((a,b)=>(b.exact?.netAfterGas??-Infinity)-(a.exact?.netAfterGas??-Infinity));
+  const best=ranked.find(x=>x.stage==='EXACT_PASS'&&x.exact?.status==='PASS')||ranked[0]||{stage:'UNAVAILABLE',exact:{status:'BLOCKED',reason:'no exact result'}};
+  return{...best,proofSource:'server',selectedBorrowUsd:best._size,exactAt:best.exactAt||Date.now(),testedSizes:tests.map(x=>({borrowUsd:x._size,stage:x.stage,netAfterGas:x.exact?.netAfterGas??null}))};
 }
 async function scan(cap){
-  const started=Date.now(),blockNumber=await latestBlock(true),key=blockNumber+':'+cap;
-  const cached=scanCache.get(key);if(cached&&Date.now()-cached.at<3000)return{...cached.value,cached:true};
-  if(scanInflight.has(key))return scanInflight.get(key);
-  const job=(async()=>{
-    const routes=await discoverRoutes(cap);
-    let candidates=routes.slice(0,14).map(r=>candidateFromRoute(r,blockNumber));
-    const routeById=new Map(routes.map(r=>[routeKey(r),r]));
-    const targets=candidates.filter(c=>c.screenNet>minThreshold(c.borrowUsd)+2).slice(0,4);
-    await mapLimit(targets,1,async c=>{c.exactEnvelope=await exactCandidate(c,routeById.get(c.id)?.modelCurve||[]);return c});
-    candidates.sort((a,b)=>(b.exactEnvelope?.exact?.netAfterGas??-999999)-(a.exactEnvelope?.exact?.netAfterGas??-999999)||b.screenNet-a.screenNet);
-    const value={ok:true,engine:'Flash Edge V9.4.1',mode:'hybrid low-RPC discovery + adaptive $250K model + local exact/prepare',rpcPolicy:RPC_LABEL,blockNumber,latencyMs:Date.now()-started,assets:ASSETS.length,venues:3,searchCapUsd:cap,discoveredRoutes:routes.length,candidateCount:candidates.length,sameDexCandidates:candidates.filter(c=>c.sameDex).length,exactChecks:targets.length,exactPasses:candidates.filter(c=>c.exactEnvelope?.stage==='EXACT_PASS'&&c.exactEnvelope?.exact?.status==='PASS').length,candidates};
-    scanCache.set(key,{at:Date.now(),value});
-    for(const [k,v] of scanCache)if(Date.now()-v.at>10000)scanCache.delete(k);
-    return value;
-  })();
-  scanInflight.set(key,job);try{return await job}finally{scanInflight.delete(key)}
+  const started=Date.now(),blockNumber=await latestBlock(),pairs=await fetchScreenPairs(),allRoutes=buildScreenRoutes(pairs,cap),visible=allRoutes.slice(0,12),targets=visible.slice(0,5);
+  const exacts=await mapLimit(targets,2,(r,i)=>exactRoute(r,i<3?3:2));
+  const exactById=new Map(targets.map((r,i)=>[r.id,exacts[i]]));
+  let candidates=visible.map(r=>{
+    const e=exactById.get(r.id)||{stage:'SCREEN_ONLY',proofSource:'screen',exact:{status:'BLOCKED',reason:'exact budget reserved for higher-ranked routes this block'}};
+    const selected=Number(e.selectedBorrowUsd||r.borrowUsd);return{...r,blockNumber,borrowUsd:selected,b:selected,optimalBorrow:selected,exactEnvelope:e};
+  });
+  candidates.sort((a,b)=>{
+    const ap=a.exactEnvelope?.stage==='EXACT_PASS'?1:0,bp=b.exactEnvelope?.stage==='EXACT_PASS'?1:0;if(bp!==ap)return bp-ap;
+    const an=a.exactEnvelope?.exact?.netAfterGas??-Infinity,bn=b.exactEnvelope?.exact?.netAfterGas??-Infinity;if(bn!==an)return bn-an;return b.screenNet-a.screenNet;
+  });
+  const exactPasses=candidates.filter(c=>c.exactEnvelope?.stage==='EXACT_PASS'&&c.exactEnvelope?.exact?.status==='PASS').length;
+  return{ok:true,engine:'Flash Edge V9.4.1',mode:'rate-safe screen → bounded on-chain exact → live prepare',rpcPolicy:RPC_LABEL,blockNumber,latencyMs:Date.now()-started,assets:ASSETS.length,venues:3,searchCapUsd:cap,screenPairs:pairs.length,screenRouteCount:allRoutes.length,candidateCount:candidates.length,sameDexCandidates:candidates.filter(c=>c.sameDex).length,exactChecks:exacts.reduce((n,e)=>n+(e?.testedSizes?.length||0),0),exactPasses,candidates};
 }
-
 async function receiverCheck(receiver,owner){
   if(!validAddress(receiver)||!validAddress(owner))throw Error('invalid receiver or owner');
   const code=await rpc('eth_getCode',[receiver,'latest']);if(!code||code==='0x')throw Error('no receiver bytecode');
   const hash='0x'+createHash('sha256').update(String(code).toLowerCase()).digest('hex');if(norm(hash)!==norm(APPROVED_RUNTIME))throw Error('receiver runtime mismatch');
   async function read(fn){const data=encodeFunctionData({abi:RX,functionName:fn}),out=await call(receiver,data,'latest');return decodeFunctionResult({abi:RX,functionName:fn,data:out})}
-  const [chainOwner,paused,borrowCap]=await Promise.all([read('owner'),read('paused'),read('maxBorrowRaw')]);if(norm(chainOwner)!==norm(owner))throw Error('owner mismatch');
-  return{ok:true,owner:chainOwner,paused:Boolean(paused),capUsd:Number(borrowCap)/1e6,runtimeHash:hash};
+  const[chainOwner,paused,cap]=await Promise.all([read('owner'),read('paused'),read('maxBorrowRaw')]);if(norm(chainOwner)!==norm(owner))throw Error('owner mismatch');
+  return{ok:true,owner:chainOwner,paused:Boolean(paused),capUsd:Number(cap)/1e6,runtimeHash:hash};
 }
-
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||req.body?.action||'health');
-    if(action==='health')return ok(res,{ok:true,engine:'Flash Edge V9.4.1',mode:'hybrid low-RPC discovery + adaptive sizing + local exact/prepare',rpcPolicy:RPC_LABEL,assets:ASSETS.length,maxSearchUsd:250000});
+    if(action==='health')return ok(res,{ok:true,engine:'Flash Edge V9.4.1',mode:'rate-safe screen → bounded on-chain exact → live prepare',rpcPolicy:RPC_LABEL,assets:ASSETS.length,maxSearchUsd:250000});
     if(action==='block')return ok(res,{ok:true,blockNumber:await latestBlock(),serverTime:Date.now(),rpcPolicy:RPC_LABEL});
-    if(action==='scan'){const requested=Number(req.body?.cap??req.query?.cap??10000),cap=Math.min(250000,Math.max(1000,Number.isFinite(requested)?requested:10000));return ok(res,await scan(cap))}
+    if(action==='scan')return ok(res,await scan(Math.min(250000,Math.max(1000,Number(req.body?.cap)||250000))));
     if(action==='receiver')return ok(res,await receiverCheck(String(req.body?.receiver||''),String(req.body?.owner||'')));
     if(action==='prepare'){
       const c=req.body?.candidate,env=c?.exactEnvelope;if(env?.stage!=='EXACT_PASS'||env?.exact?.status!=='PASS')return fail(res,'fresh EXACT_PASS required',409);
-      const route={...c,chainKey:'base',optimalBorrow:Number(c.borrowUsd||c.b)};return ok(res,await prepareLive({route,receiver:String(req.body?.receiver||''),from:String(req.body?.from||'')}));
+      const route={...c,chainKey:'base',optimalBorrow:Number(env.selectedBorrowUsd||c.borrowUsd||c.b)};
+      return ok(res,await prepareLive({route,receiver:String(req.body?.receiver||''),from:String(req.body?.from||'')}));
     }
     if(action==='rpc'){
       const method=String(req.body?.method||''),allowed=new Set(['eth_getBalance','eth_getTransactionCount','eth_estimateGas','eth_gasPrice','eth_sendRawTransaction','eth_getTransactionReceipt','eth_chainId']);
-      if(!allowed.has(method))return fail(res,'RPC method blocked',403);return ok(res,{ok:true,result:await rpc(method,Array.isArray(req.body?.params)?req.body.params:[])});
+      if(!allowed.has(method))return fail(res,'RPC method blocked',403);
+      return ok(res,{ok:true,result:await rpc(method,Array.isArray(req.body?.params)?req.body.params:[])});
     }
     return fail(res,'unknown action',404);
-  }catch(e){console.error('v94-engine',e);return fail(res,e?.message||String(e),503)}
+  }catch(e){console.error('v941-engine',e);return fail(res,e?.message||String(e),503)}
 }
