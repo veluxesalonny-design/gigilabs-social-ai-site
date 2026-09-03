@@ -1,0 +1,23 @@
+name: Flash Edge V9.3 Validate
+on:
+  push:
+    branches: [flash-edge-v93-static]
+    paths:
+      - 'flash-edge-v93/**'
+      - '.github/workflows/flash-edge-v93-validate.yml'
+  workflow_dispatch:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flash-edge-v93
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install --ignore-scripts
+      - run: node --check api/engine.js
+      - run: node --check app.js
+      - run: node -e "JSON.parse(require('fs').readFileSync('vercel.json','utf8')); JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log('JSON OK')"
