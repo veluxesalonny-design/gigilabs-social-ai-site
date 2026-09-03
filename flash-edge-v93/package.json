@@ -1,1 +1,1 @@
-{"name":"gigilabs-flash-edge-v94","private":true,"version":"9.4.0","type":"module","engines":{"node":"24.x"},"dependencies":{"viem":"2.56.1"}}
+{"name":"gigilabs-flash-edge-v941","private":true,"version":"9.4.1","type":"module","engines":{"node":"24.x"},"dependencies":{"viem":"2.56.1"}}
