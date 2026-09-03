@@ -30,6 +30,7 @@ function validAddress(x){return /^0x[0-9a-fA-F]{40}$/.test(String(x||''))}
 function dexName(x){x=norm(x);return x.includes('aerodrome')?'Aerodrome':x.includes('uniswap')?'Uniswap':x.includes('sushi')?'Sushi':null}
 function isRate(status,msg){return status===429||/rate|limit|too many|over rate|quota/i.test(String(msg||''))}
 function routeKey(r){return [r.assetSymbol,norm(r.buyPair||r.buyMeta?.pair),norm(r.sellPair||r.sellMeta?.pair)].join(':')}
+function unsupportedReason(env){const s=String(env?.exact?.reason||'');return env?.stage==='UNAVAILABLE'&&/factory unsupported|unsupported .*pool|pool mismatch|token mismatch/i.test(s)?s:''}
 async function mapLimit(items,limit,fn){const out=new Array(items.length);let next=0;async function worker(){while(true){const i=next++;if(i>=items.length)return;try{out[i]=await fn(items[i],i)}catch{out[i]=null}}}await Promise.all(Array.from({length:Math.min(limit,items.length)},()=>worker()));return out}
 
 async function rpc(method,params=[]){
@@ -110,13 +111,20 @@ async function exactRoute(route,budget){
   return{...best,proofSource:'server',selectedBorrowUsd:best._size,exactAt:best.exactAt||Date.now(),testedSizes:tests.map(x=>({borrowUsd:x._size,stage:x.stage,netAfterGas:x.exact?.netAfterGas??null}))};
 }
 async function scan(cap){
-  const started=Date.now(),blockNumber=await latestBlock(),pairs=await fetchScreenPairs(),allRoutes=buildScreenRoutes(pairs,cap),visible=allRoutes.slice(0,12),targets=visible.slice(0,5);
-  const exacts=await mapLimit(targets,2,(r,i)=>exactRoute(r,i<3?3:2));
-  const exactById=new Map(targets.map((r,i)=>[r.id,exacts[i]]));
-  let candidates=visible.map(r=>{const e=exactById.get(r.id)||{stage:'SCREEN_ONLY',proofSource:'screen',exact:{status:'BLOCKED',reason:'exact budget reserved for higher-ranked routes this block'}};const selected=Number(e.selectedBorrowUsd||r.borrowUsd);return{...r,blockNumber,borrowUsd:selected,b:selected,optimalBorrow:selected,exactEnvelope:e}});
+  const started=Date.now(),blockNumber=await latestBlock(),pairs=await fetchScreenPairs(),allRoutes=buildScreenRoutes(pairs,cap),visible=allRoutes.slice(0,14),exactById=new Map(),blockedPairs=new Set();
+  let exactChecks=0,exactRoutes=0,suppressedUnsupported=0;
+  for(const r of visible){
+    if(exactChecks>=10||exactRoutes>=5)break;
+    const bk=norm(r.buyPair),sk=norm(r.sellPair);
+    if(blockedPairs.has(bk)||blockedPairs.has(sk)){exactById.set(r.id,{stage:'UNSUPPORTED_POOL',proofSource:'server',exact:{status:'BLOCKED',reason:'pool suppressed after unsupported adapter/factory proof on this scan'}});suppressedUnsupported++;continue}
+    const e=await exactRoute(r,Math.min(2,10-exactChecks));exactById.set(r.id,e);exactChecks+=e?.testedSizes?.length||0;exactRoutes++;
+    const reason=unsupportedReason(e);
+    if(reason){if(/SERVER BUY/i.test(reason))blockedPairs.add(bk);else if(/SERVER SELL/i.test(reason))blockedPairs.add(sk);else{blockedPairs.add(bk);blockedPairs.add(sk)}}
+  }
+  let candidates=visible.slice(0,12).map(r=>{const e=exactById.get(r.id)||{stage:'SCREEN_ONLY',proofSource:'screen',exact:{status:'BLOCKED',reason:'exact budget reserved for higher-ranked supported routes this block'}};const selected=Number(e.selectedBorrowUsd||r.borrowUsd);return{...r,blockNumber,borrowUsd:selected,b:selected,optimalBorrow:selected,exactEnvelope:e}});
   candidates.sort((a,b)=>{const ap=a.exactEnvelope?.stage==='EXACT_PASS'?1:0,bp=b.exactEnvelope?.stage==='EXACT_PASS'?1:0;if(bp!==ap)return bp-ap;const an=a.exactEnvelope?.exact?.netAfterGas??-Infinity,bn=b.exactEnvelope?.exact?.netAfterGas??-Infinity;if(bn!==an)return bn-an;return b.screenNet-a.screenNet});
   const exactPasses=candidates.filter(c=>c.exactEnvelope?.stage==='EXACT_PASS'&&c.exactEnvelope?.exact?.status==='PASS').length;
-  return{ok:true,engine:'Flash Edge V9.4.2',mode:'broad off-chain screen → bounded on-chain exact → live prepare',rpcPolicy:RPC_LABEL,blockNumber,latencyMs:Date.now()-started,assets:ASSETS.length,venues:3,searchCapUsd:cap,screenPairs:pairs.length,screenRouteCount:allRoutes.length,candidateCount:candidates.length,sameDexCandidates:candidates.filter(c=>c.sameDex).length,exactChecks:exacts.reduce((n,e)=>n+(e?.testedSizes?.length||0),0),exactPasses,candidates};
+  return{ok:true,engine:'Flash Edge V9.4.2',mode:'broad screen → unsupported-pool suppression → bounded exact → live prepare',rpcPolicy:RPC_LABEL,blockNumber,latencyMs:Date.now()-started,assets:ASSETS.length,venues:3,searchCapUsd:cap,screenPairs:pairs.length,screenRouteCount:allRoutes.length,candidateCount:candidates.length,sameDexCandidates:candidates.filter(c=>c.sameDex).length,exactRoutes,exactChecks,suppressedUnsupported,exactPasses,candidates};
 }
 async function receiverCheck(receiver,owner){
   if(!validAddress(receiver)||!validAddress(owner))throw Error('invalid receiver or owner');
@@ -129,7 +137,7 @@ async function receiverCheck(receiver,owner){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||req.body?.action||'health');
-    if(action==='health')return ok(res,{ok:true,engine:'Flash Edge V9.4.2',mode:'broad off-chain screen → bounded on-chain exact → live prepare',rpcPolicy:RPC_LABEL,assets:ASSETS.length,maxSearchUsd:250000});
+    if(action==='health')return ok(res,{ok:true,engine:'Flash Edge V9.4.2',mode:'broad screen → unsupported-pool suppression → bounded exact → live prepare',rpcPolicy:RPC_LABEL,assets:ASSETS.length,maxSearchUsd:250000});
     if(action==='block')return ok(res,{ok:true,blockNumber:await latestBlock(),serverTime:Date.now(),rpcPolicy:RPC_LABEL});
     if(action==='scan')return ok(res,await scan(Math.min(250000,Math.max(1000,Number(req.body?.cap)||250000))));
     if(action==='receiver')return ok(res,await receiverCheck(String(req.body?.receiver||''),String(req.body?.owner||'')));
