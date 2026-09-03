@@ -12,6 +12,7 @@ const units=(n,d)=>BigInt(Math.round(Number(n)*1e6))*10n**BigInt(d)/1000000n;
 const toNum=(n,d)=>Number(n)/10**d;
 const minOut=x=>x*9980n/10000n;
 let rpcCursor=0;
+const rpcState=RPCS.map(()=>({coolUntil:0,failures:0}));
 
 const erc20=parseAbi(['function decimals() view returns(uint8)']);
 const uniPool=parseAbi(['function token0() view returns(address)','function token1() view returns(address)','function factory() view returns(address)','function fee() view returns(uint24)']);
@@ -25,17 +26,19 @@ const sushiRouter=parseAbi(['function factory() view returns(address)','function
 
 async function rpc(method,params=[],timeout=3400){
   let last='Base RPC unavailable';
-  const start=rpcCursor++%RPCS.length;
-  for(let i=0;i<RPCS.length;i++){
-    const url=RPCS[(start+i)%RPCS.length];
-    const c=new AbortController();
-    const t=setTimeout(()=>c.abort(),timeout);
-    try{
-      const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
-      const j=await r.json();
-      if(r.ok&&!j.error&&j.result!==undefined)return j.result;
-      last=j.error?.message||`HTTP ${r.status}`;
-    }catch(e){last=e?.message||String(e)}finally{clearTimeout(t)}
+  const now=Date.now(),start=rpcCursor++%RPCS.length;
+  for(let pass=0;pass<2;pass++){
+    for(let i=0;i<RPCS.length;i++){
+      const idx=(start+i)%RPCS.length,state=rpcState[idx];if(pass===0&&state.coolUntil>now)continue;
+      const url=RPCS[idx],c=new AbortController(),t=setTimeout(()=>c.abort(),timeout);
+      try{
+        const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
+        const text=await r.text();let j=null;try{j=JSON.parse(text)}catch{}
+        if(r.ok&&j&&!j.error&&j.result!==undefined){state.failures=0;state.coolUntil=0;return j.result}
+        const msg=j?.error?.message||text.slice(0,180)||`HTTP ${r.status}`;last=msg;state.failures++;
+        if(r.status===429||/rate limit|over rate|usage limit|forbidden|too many|<!doctype|<html/i.test(msg))state.coolUntil=Date.now()+Math.min(60000,12000*state.failures);
+      }catch(e){last=e?.message||String(e);state.failures++;state.coolUntil=Date.now()+Math.min(30000,5000*state.failures)}finally{clearTimeout(t)}
+    }
   }
   throw Error(last);
 }
