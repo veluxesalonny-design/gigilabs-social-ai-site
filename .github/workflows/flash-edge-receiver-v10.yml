@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - flash-edge-receiver-v10
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
