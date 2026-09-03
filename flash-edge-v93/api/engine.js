@@ -42,7 +42,19 @@ function validAddress(x){return /^0x[0-9a-fA-F]{40}$/.test(String(x||''))}
 function blockHex(n){return '0x'+n.toString(16)}
 function norm(x){return String(x||'').toLowerCase()}
 function routeKey(r){return [r.assetSymbol,norm(r.buyMeta?.pair),norm(r.sellMeta?.pair)].join(':')}
-function sizeKey(r){return routeKey(r)+':'+Number(r.borrowUsd)}
+async function mapLimit(items,limit,fn){
+  const out=new Array(items.length);
+  let next=0;
+  async function worker(){
+    while(true){
+      const i=next++;
+      if(i>=items.length)return;
+      try{out[i]=await fn(items[i],i)}catch(e){out[i]=null}
+    }
+  }
+  await Promise.all(Array.from({length:Math.min(limit,items.length)},()=>worker()));
+  return out;
+}
 
 async function rpc(method,params=[]){
   let last='Base RPC unavailable';
@@ -50,7 +62,7 @@ async function rpc(method,params=[]){
   for(let i=0;i<RPCS.length;i++){
     const url=RPCS[(start+i)%RPCS.length];
     const c=new AbortController();
-    const t=setTimeout(()=>c.abort(),3600);
+    const t=setTimeout(()=>c.abort(),4200);
     try{
       const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:c.signal});
       const j=await r.json();
@@ -73,20 +85,20 @@ async function metasFor(asset,block){
   const cached=metaCache.get(asset.symbol);
   if(cached&&Date.now()-cached.at<900000)return cached.value;
   const [uni,aero,sushi]=await Promise.all([
-    Promise.all([100,500,3000,10000].map(async fee=>{
+    mapLimit([100,500,3000,10000],2,async fee=>{
       try{
         const out=await call(UNI_FACTORY,encodeFunctionData({abi:UF,functionName:'getPool',args:[USDC,asset.address,fee]}),block);
         const pair=decodeFunctionResult({abi:UF,functionName:'getPool',data:out});
         return norm(pair)===ZERO?null:{venue:'Uniswap',pair,fee};
       }catch{return null}
-    })),
-    Promise.all([1,10,50,100,200].map(async tickSpacing=>{
+    }),
+    mapLimit([1,10,50,100,200],2,async tickSpacing=>{
       try{
         const out=await call(AERO_FACTORY,encodeFunctionData({abi:AF,functionName:'getPool',args:[USDC,asset.address,tickSpacing]}),block);
         const pair=decodeFunctionResult({abi:AF,functionName:'getPool',data:out});
         return norm(pair)===ZERO?null:{venue:'Aerodrome',pair,tickSpacing};
       }catch{return null}
-    })),
+    }),
     (async()=>{
       try{
         const fac=await getSushiFactory(block);
@@ -115,27 +127,19 @@ async function quoteOne(meta,tokenIn,tokenOut,amountIn,block){
   const a=decodeFunctionResult({abi:SR,functionName:'getAmountsOut',data:out});
   return BigInt(a[a.length-1]||0n);
 }
-
-async function safeQuote(meta,tokenIn,tokenOut,amountIn,block){
-  try{
-    const out=await quoteOne(meta,tokenIn,tokenOut,amountIn,block);
-    return out>0n?{meta,out}:null;
-  }catch{return null}
-}
+async function safeQuote(meta,tokenIn,tokenOut,amountIn,block){try{const out=await quoteOne(meta,tokenIn,tokenOut,amountIn,block);return out>0n?{meta,out}:null}catch{return null}}
 
 async function discoverAssetRoutes(asset,metas,blockNumber){
   const all=flattenMetas(metas);
   if(all.length<2)return [];
-  const block=blockHex(blockNumber);
-  const anchorUsd=1000;
-  const anchorRaw=1000n*1000000n;
-  const buys=(await Promise.all(all.map(meta=>safeQuote(meta,USDC,asset.address,anchorRaw,block)))).filter(Boolean).sort((a,b)=>a.out>b.out?-1:a.out<b.out?1:0).slice(0,3);
+  const block=blockHex(blockNumber),anchorRaw=1000n*1000000n;
+  const buys=(await mapLimit(all,4,meta=>safeQuote(meta,USDC,asset.address,anchorRaw,block))).filter(Boolean).sort((a,b)=>a.out>b.out?-1:a.out<b.out?1:0).slice(0,3);
   const routes=[];
   for(const buy of buys){
-    const sells=(await Promise.all(all.filter(meta=>norm(meta.pair)!==norm(buy.meta.pair)).map(meta=>safeQuote(meta,asset.address,USDC,buy.out,block)))).filter(Boolean).sort((a,b)=>a.out>b.out?-1:a.out<b.out?1:0).slice(0,3);
+    const sellMetas=all.filter(meta=>norm(meta.pair)!==norm(buy.meta.pair));
+    const sells=(await mapLimit(sellMetas,4,meta=>safeQuote(meta,asset.address,USDC,buy.out,block))).filter(Boolean).sort((a,b)=>a.out>b.out?-1:a.out<b.out?1:0).slice(0,3);
     for(const sell of sells){
-      const returned=Number(sell.out)/1e6;
-      const anchorNet=returned-anchorUsd-anchorUsd*.0005-.75;
+      const returned=Number(sell.out)/1e6,anchorNet=returned-1000-.5-.75;
       if(anchorNet<-6)continue;
       routes.push({assetSymbol:asset.symbol,assetAddress:asset.address,buyDex:buy.meta.venue,sellDex:sell.meta.venue,buyMeta:buy.meta,sellMeta:sell.meta,anchorNet,sameDex:buy.meta.venue===sell.meta.venue});
     }
@@ -145,10 +149,7 @@ async function discoverAssetRoutes(asset,metas,blockNumber){
   return [...dedup.values()];
 }
 
-function coarseSizes(cap){
-  const raw=[1000,Math.min(10000,cap),Math.min(50000,cap),Math.min(150000,cap),cap];
-  return [...new Set(raw.filter(x=>x>=1000&&x<=cap).map(x=>Math.round(x)))].sort((a,b)=>a-b);
-}
+function coarseSizes(cap){return [...new Set([1000,Math.min(10000,cap),Math.min(50000,cap),Math.min(150000,cap),cap].filter(x=>x>=1000&&x<=cap).map(x=>Math.round(x)))].sort((a,b)=>a-b)}
 function adaptiveSizes(best,cap){
   const ladder=[...new Set([...MASTER_SIZES.filter(x=>x<=cap),cap])].sort((a,b)=>a-b);
   let nearest=0;
@@ -163,72 +164,34 @@ function adaptiveSizes(best,cap){
 }
 
 async function evaluateRoute(route,borrowUsd,blockNumber){
-  const block=blockHex(blockNumber);
-  const amountIn=BigInt(Math.round(borrowUsd*1e6));
+  const block=blockHex(blockNumber),amountIn=BigInt(Math.round(borrowUsd*1e6));
   const buyOut=await quoteOne(route.buyMeta,USDC,route.assetAddress,amountIn,block);
   if(buyOut<=0n)throw Error('zero buy quote');
   const sellOut=await quoteOne(route.sellMeta,route.assetAddress,USDC,buyOut,block);
   if(sellOut<=0n)throw Error('zero sell quote');
-  const returned=Number(sellOut)/1e6;
-  const screenNet=returned-borrowUsd-borrowUsd*.0005-.75;
-  const spreadBps=(returned/borrowUsd-1)*10000;
-  return {
-    id:routeKey(route),k:'base',chain:'Base',chainId:8453,blockNumber,
-    assetSymbol:route.assetSymbol,assetAddress:route.assetAddress,
-    quoteSymbol:'USDC',quoteAddress:USDC,
-    buyDex:route.buyDex,sellDex:route.sellDex,bd:route.buyDex,sd:route.sellDex,
-    buyPair:route.buyMeta.pair,sellPair:route.sellMeta.pair,
-    buyMeta:route.buyMeta,sellMeta:route.sellMeta,sameDex:route.sameDex,
-    borrowUsd,b:borrowUsd,optimalBorrow:borrowUsd,screenNet,spreadBps,gas:.75
-  };
+  const returned=Number(sellOut)/1e6,screenNet=returned-borrowUsd-borrowUsd*.0005-.75,spreadBps=(returned/borrowUsd-1)*10000;
+  return{id:routeKey(route),k:'base',chain:'Base',chainId:8453,blockNumber,assetSymbol:route.assetSymbol,assetAddress:route.assetAddress,quoteSymbol:'USDC',quoteAddress:USDC,buyDex:route.buyDex,sellDex:route.sellDex,bd:route.buyDex,sd:route.sellDex,buyPair:route.buyMeta.pair,sellPair:route.sellMeta.pair,buyMeta:route.buyMeta,sellMeta:route.sellMeta,sameDex:route.sameDex,borrowUsd,b:borrowUsd,optimalBorrow:borrowUsd,screenNet,spreadBps,gas:.75};
 }
-
-async function evaluateSafe(route,size,blockNumber){try{return await evaluateRoute(route,size,blockNumber)}catch{return null}}
+async function evaluateSafe(task,blockNumber){try{return await evaluateRoute(task.route,task.size,blockNumber)}catch{return null}}
 
 async function scan(cap){
-  const started=Date.now();
-  const blockNumber=await latestBlock();
-  const block=blockHex(blockNumber);
-  const assetMetas=await Promise.all(ASSETS.map(async a=>[a,await metasFor(a,block)]));
-  const discovered=(await Promise.all(assetMetas.map(([asset,metas])=>discoverAssetRoutes(asset,metas,blockNumber)))).flat().sort((a,b)=>b.anchorNet-a.anchorNet).slice(0,18);
-  const coarse=coarseSizes(cap);
-  const evaluated=(await Promise.all(discovered.flatMap(route=>coarse.map(size=>evaluateSafe(route,size,blockNumber))))).filter(Boolean);
+  const started=Date.now(),blockNumber=await latestBlock(),block=blockHex(blockNumber);
+  const assetMetas=(await mapLimit(ASSETS,3,async asset=>[asset,await metasFor(asset,block)])).filter(Boolean);
+  const discovered=(await mapLimit(assetMetas,3,([asset,metas])=>discoverAssetRoutes(asset,metas,blockNumber))).filter(Boolean).flat().sort((a,b)=>b.anchorNet-a.anchorNet).slice(0,18);
+  const coarse=coarseSizes(cap),tasks=discovered.flatMap(route=>coarse.map(size=>({route,size})));
+  const evaluated=(await mapLimit(tasks,5,t=>evaluateSafe(t,blockNumber))).filter(Boolean);
   const bestByRoute=new Map();
   for(const c of evaluated){const k=routeKey(c),p=bestByRoute.get(k);if(!p||c.screenNet>p.screenNet)bestByRoute.set(k,c)}
-  const topRoutes=[...bestByRoute.values()].sort((a,b)=>b.screenNet-a.screenNet).slice(0,6);
-  const sourceByKey=new Map(discovered.map(r=>[routeKey(r),r]));
-  const refinements=[];
-  for(const best of topRoutes){
-    const source=sourceByKey.get(routeKey(best));
-    if(!source)continue;
-    const already=new Set(coarse);
-    for(const size of adaptiveSizes(best.borrowUsd,cap))if(!already.has(size))refinements.push(evaluateSafe(source,size,blockNumber));
-  }
-  const refined=(await Promise.all(refinements)).filter(Boolean);
-  const all=[...evaluated,...refined];
-  const grouped=new Map();
-  const sizesByRoute=new Map();
-  for(const c of all){
-    const k=routeKey(c);
-    const arr=sizesByRoute.get(k)||[];
-    arr.push({borrowUsd:c.borrowUsd,net:c.screenNet});
-    sizesByRoute.set(k,arr);
-    const p=grouped.get(k);
-    if(!p||c.screenNet>p.screenNet)grouped.set(k,c);
-  }
+  const topRoutes=[...bestByRoute.values()].sort((a,b)=>b.screenNet-a.screenNet).slice(0,6),sourceByKey=new Map(discovered.map(r=>[routeKey(r),r]));
+  const refineTasks=[];
+  for(const best of topRoutes){const source=sourceByKey.get(routeKey(best));if(!source)continue;const already=new Set(coarse);for(const size of adaptiveSizes(best.borrowUsd,cap))if(!already.has(size))refineTasks.push({route:source,size})}
+  const refined=(await mapLimit(refineTasks,5,t=>evaluateSafe(t,blockNumber))).filter(Boolean),all=[...evaluated,...refined],grouped=new Map(),sizesByRoute=new Map();
+  for(const c of all){const k=routeKey(c),arr=sizesByRoute.get(k)||[];arr.push({borrowUsd:c.borrowUsd,net:c.screenNet});sizesByRoute.set(k,arr);const p=grouped.get(k);if(!p||c.screenNet>p.screenNet)grouped.set(k,c)}
   let candidates=[...grouped.values()].map(c=>({...c,testedSizes:(sizesByRoute.get(routeKey(c))||[]).sort((a,b)=>a.borrowUsd-b.borrowUsd)})).sort((a,b)=>b.screenNet-a.screenNet).slice(0,14);
   const exactTargets=candidates.filter(c=>c.screenNet>-3).slice(0,6);
-  await Promise.all(exactTargets.map(async c=>{c.exactEnvelope=await exactBase(c)}));
+  await mapLimit(exactTargets,2,async c=>{c.exactEnvelope=await exactBase(c);return c});
   candidates.sort((a,b)=>(b.exactEnvelope?.exact?.netAfterGas??-999999)-(a.exactEnvelope?.exact?.netAfterGas??-999999)||b.screenNet-a.screenNet);
-  return {
-    ok:true,engine:'Flash Edge V9.4',mode:'new-block high-cap adaptive on-chain + local exact/prepare',
-    rpcPolicy:RPC_LABEL,blockNumber,latencyMs:Date.now()-started,
-    assets:ASSETS.length,venues:3,searchCapUsd:cap,coarseSizes:coarse,
-    discoveredRoutes:discovered.length,candidateCount:candidates.length,
-    sameDexCandidates:candidates.filter(c=>c.sameDex).length,
-    exactPasses:candidates.filter(c=>c.exactEnvelope?.stage==='EXACT_PASS'&&c.exactEnvelope?.exact?.status==='PASS').length,
-    candidates
-  };
+  return{ok:true,engine:'Flash Edge V9.4',mode:'new-block high-cap adaptive on-chain + local exact/prepare',rpcPolicy:RPC_LABEL,blockNumber,latencyMs:Date.now()-started,assets:ASSETS.length,venues:3,searchCapUsd:cap,coarseSizes:coarse,discoveredRoutes:discovered.length,evaluatedQuotes:evaluated.length,candidateCount:candidates.length,sameDexCandidates:candidates.filter(c=>c.sameDex).length,exactPasses:candidates.filter(c=>c.exactEnvelope?.stage==='EXACT_PASS'&&c.exactEnvelope?.exact?.status==='PASS').length,candidates};
 }
 
 async function receiverCheck(receiver,owner){
@@ -249,8 +212,7 @@ export default async function handler(req,res){
     if(action==='health')return ok(res,{ok:true,engine:'Flash Edge V9.4',mode:'new-block high-cap adaptive on-chain + local exact/prepare',rpcPolicy:RPC_LABEL,assets:ASSETS.length,maxSearchUsd:250000});
     if(action==='block')return ok(res,{ok:true,blockNumber:await latestBlock(),serverTime:Date.now(),rpcPolicy:RPC_LABEL});
     if(action==='scan'){
-      const requested=Number(req.body?.cap??req.query?.cap??10000);
-      const cap=Math.min(250000,Math.max(1000,Number.isFinite(requested)?requested:10000));
+      const requested=Number(req.body?.cap??req.query?.cap??10000),cap=Math.min(250000,Math.max(1000,Number.isFinite(requested)?requested:10000));
       return ok(res,await scan(cap));
     }
     if(action==='receiver')return ok(res,await receiverCheck(String(req.body?.receiver||''),String(req.body?.owner||'')));
@@ -261,8 +223,7 @@ export default async function handler(req,res){
       return ok(res,await prepareLive({route,receiver:String(req.body?.receiver||''),from:String(req.body?.from||'')}));
     }
     if(action==='rpc'){
-      const method=String(req.body?.method||'');
-      const allowed=new Set(['eth_getBalance','eth_getTransactionCount','eth_estimateGas','eth_gasPrice','eth_sendRawTransaction','eth_getTransactionReceipt','eth_chainId']);
+      const method=String(req.body?.method||''),allowed=new Set(['eth_getBalance','eth_getTransactionCount','eth_estimateGas','eth_gasPrice','eth_sendRawTransaction','eth_getTransactionReceipt','eth_chainId']);
       if(!allowed.has(method))return fail(res,'RPC method blocked',403);
       return ok(res,{ok:true,result:await rpc(method,Array.isArray(req.body?.params)?req.body.params:[])});
     }
