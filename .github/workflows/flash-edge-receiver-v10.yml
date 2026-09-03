@@ -1,0 +1,35 @@
+name: Flash Edge Receiver V10 Compile
+
+on:
+  push:
+    branches:
+      - flash-edge-receiver-v10
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Compile optimized receiver
+        run: |
+          mkdir -p build/flash-edge-v10
+          npx --yes solc@0.8.24 --optimize --optimize-runs 200 --bin --abi flash-edge/FlashEdgeReceiverV10.sol -o build/flash-edge-v10
+          test -s build/flash-edge-v10/flash-edge_FlashEdgeReceiverV10_sol_FlashEdgeReceiverV10.bin
+          test -s build/flash-edge-v10/flash-edge_FlashEdgeReceiverV10_sol_FlashEdgeReceiverV10.abi
+      - name: Record bytecode size
+        run: |
+          BYTES=$(( $(wc -c < build/flash-edge-v10/flash-edge_FlashEdgeReceiverV10_sol_FlashEdgeReceiverV10.bin) / 2 ))
+          echo "Creation bytecode bytes: $BYTES"
+          test "$BYTES" -lt 49152
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flash-edge-receiver-v10-compiled
+          path: build/flash-edge-v10/
+          retention-days: 7
