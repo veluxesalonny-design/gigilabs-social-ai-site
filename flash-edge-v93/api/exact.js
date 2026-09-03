@@ -1,6 +1,6 @@
 import { parseAbi, encodeFunctionData, decodeFunctionResult } from 'viem';
 
-const RPCS=['https://base-rpc.publicnode.com','https://mainnet.base.org','https://base.llamarpc.com','https://1rpc.io/base'];
+const RPCS=['https://base-rpc.publicnode.com','https://mainnet.base.org','https://base.llamarpc.com'];
 const AAVE='0xA238Dd80C259a72e81d7e4664a9801593F98d1c5';
 const UNI_FACTORY='0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
 const UNI_QUOTER='0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a';
@@ -11,6 +11,7 @@ const norm=x=>String(x||'').toLowerCase();
 const units=(n,d)=>BigInt(Math.round(Number(n)*1e6))*10n**BigInt(d)/1000000n;
 const toNum=(n,d)=>Number(n)/10**d;
 const minOut=x=>x*9980n/10000n;
+let rpcCursor=0;
 
 const erc20=parseAbi(['function decimals() view returns(uint8)']);
 const uniPool=parseAbi(['function token0() view returns(address)','function token1() view returns(address)','function factory() view returns(address)','function fee() view returns(uint24)']);
@@ -22,9 +23,11 @@ const aeroQuoter=parseAbi(['function quoteExactInputSingle((address tokenIn,addr
 const sushiPair=parseAbi(['function token0() view returns(address)','function token1() view returns(address)','function factory() view returns(address)']);
 const sushiRouter=parseAbi(['function factory() view returns(address)','function getAmountsOut(uint256,address[]) view returns(uint256[])']);
 
-async function rpc(method,params=[],timeout=3200){
+async function rpc(method,params=[],timeout=3400){
   let last='Base RPC unavailable';
-  for(const url of RPCS){
+  const start=rpcCursor++%RPCS.length;
+  for(let i=0;i<RPCS.length;i++){
+    const url=RPCS[(start+i)%RPCS.length];
     const c=new AbortController();
     const t=setTimeout(()=>c.abort(),timeout);
     try{
@@ -122,6 +125,7 @@ export async function exactBase(o){
     return{stage:'UNAVAILABLE',chainKey:'base',chain:'Base',executionEligible:false,exact:{status:'BLOCKED',reason:'SERVER '+phase+' · '+(e?.message||'Base exact unavailable')}};
   }
 }
+
 export default async function handler(req,res){
   if(req.method!=='POST')return res.status(405).json({error:'method_not_allowed'});
   return res.status(200).json(await exactBase(req.body||{}));
