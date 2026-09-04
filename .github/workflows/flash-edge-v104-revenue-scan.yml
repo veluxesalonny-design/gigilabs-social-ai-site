@@ -1,0 +1,55 @@
+name: Flash Edge V10.4 Revenue Scan
+on:
+  push:
+    branches: [flash-edge-v104-engine]
+    paths:
+      - 'flash-edge-v104/**'
+      - '.github/workflows/flash-edge-v104-revenue-scan.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  revenue-scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    defaults:
+      run:
+        working-directory: flash-edge-v104
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: flash-edge-v104/package.json
+      - run: npm install --ignore-scripts
+      - name: Live Base revenue scan
+        run: |
+          node --input-type=module <<'NODE'
+          import { scanEngine } from './api/engine.js';
+          const scan = await scanEngine(250000);
+          const rows = (scan.candidates || []).map(c => ({
+            asset: c.assetSymbol,
+            route: `${c.buyDex} -> ${c.sellDex}`,
+            size: c.borrowUsd,
+            spreadBps: Number(c.spreadBps || 0),
+            stage: c.exactEnvelope?.stage,
+            netAfterGas: c.exactEnvelope?.exact?.netAfterGas ?? null,
+            safetyReserveUsd: c.exactEnvelope?.safetyReserveUsd ?? null,
+            reason: c.exactEnvelope?.exact?.reason ?? null,
+          }));
+          const passes = rows.filter(x => x.stage === 'EXACT_PASS' && Number(x.netAfterGas) > 0);
+          console.log('FLASH_EDGE_REVENUE_SCAN=' + JSON.stringify({
+            blockNumber: scan.blockNumber,
+            screenPairs: scan.screenPairs,
+            screenRouteCount: scan.screenRouteCount,
+            searchDepth: scan.searchDepth,
+            exactRoutes: scan.exactRoutes,
+            exactChecks: scan.exactChecks,
+            exactPasses: passes.length,
+            bestPass: passes.sort((a,b)=>Number(b.netAfterGas)-Number(a.netAfterGas))[0] || null,
+            topCandidates: rows.slice(0,20)
+          }));
+          NODE
