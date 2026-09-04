@@ -4,10 +4,11 @@ const PROVIDERS=[
   {name:'dRPC',url:'https://base.drpc.org'}
 ];
 
-export const RPC_POLICY='BasePublic → PublicNode → dRPC · sequential failover · transport cooldown only · contract reverts do not poison providers';
-const states=PROVIDERS.map(p=>({...p,failures:0,cooldownUntil:0,lastError:null,lastGoodAt:0}));
+export const RPC_POLICY='BasePublic + PublicNode + dRPC · round-robin healthy providers · sequential failover · transport cooldown only · contract reverts do not poison providers';
+const states=PROVIDERS.map(p=>({...p,failures:0,cooldownUntil:0,lastError:null,lastGoodAt:0,requests:0}));
 const inflight=new Map();
 const cache=new Map();
+let cursor=0;
 
 function safeText(x){let s=String(x??'').replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();if(!s)return'provider error';if(/cloudflare|just a moment|challenge-platform|cf-chl|doctype html/i.test(s))return'provider returned HTML/challenge';return s.slice(0,220)}
 function makeError(code,message,retryAfterMs=0,provider=''){const e=new Error(message);e.code=code;e.retryAfterMs=retryAfterMs;e.provider=provider;return e}
@@ -18,6 +19,7 @@ function keyFor(method,params){try{return method+'|'+JSON.stringify(params)}catc
 function prune(){const now=Date.now();for(const[k,v]of cache)if(v.until<=now)cache.delete(k);while(cache.size>800)cache.delete(cache.keys().next().value)}
 function cool(s,code,cooldown){s.failures++;s.lastError=code;s.cooldownUntil=Date.now()+Math.min(300000,cooldown*Math.max(1,s.failures))}
 function markGood(s){s.failures=0;s.cooldownUntil=0;s.lastError=null;s.lastGoodAt=Date.now()}
+function providerOrder(){const start=cursor++%states.length;return Array.from({length:states.length},(_,i)=>states[(start+i)%states.length])}
 
 export function sanitizeRpcError(err){const code=String(err?.code||'RPC_ERROR'),retryAfterMs=Math.max(0,Number(err?.retryAfterMs)||0);let message=safeText(err?.message||err);if(code==='RPC_COOLDOWN')message='RPC providers cooling down';else if(code==='RPC_ALL_UNAVAILABLE')message='Base RPC providers temporarily unavailable';return{code,message,retryAfterMs}}
 
@@ -28,8 +30,9 @@ async function perform(method,params,timeout){
     throw makeError('RPC_COOLDOWN','RPC providers cooling down',retry);
   }
   let lastTransport=null,lastResponse=null;
-  for(const s of states){
+  for(const s of providerOrder()){
     if(s.cooldownUntil>Date.now())continue;
+    s.requests++;
     const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout);
     try{
       const r=await fetch(s.url,{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:controller.signal});
@@ -40,10 +43,7 @@ async function perform(method,params,timeout){
       if(r.ok&&!d?.error&&d?.result!==undefined&&d?.result!==null){markGood(s);return d.result}
       if(d?.error){
         const msg=safeText(d.error.message||'JSON-RPC error'),ec=Number(d.error.code);
-        const rate=transportClass(429,msg,type);
-        if(rate&&/rate|limit|too many|quota|capacity exceeded|request limit/i.test(msg)){cool(s,'RPC_RATE_LIMIT',90000);lastTransport=makeError('RPC_RATE_LIMIT','RPC provider rate limited',s.cooldownUntil-Date.now(),s.name);continue}
-        // A contract/method-level error describes this request, not provider health.
-        // Do not cool the endpoint or poison the rest of the scan.
+        if(/rate|limit|too many|quota|capacity exceeded|request limit/i.test(msg)){cool(s,'RPC_RATE_LIMIT',90000);lastTransport=makeError('RPC_RATE_LIMIT','RPC provider rate limited',s.cooldownUntil-Date.now(),s.name);continue}
         if(isCallLevelError(msg,ec))throw makeError('RPC_CALL_ERROR',msg,0,s.name);
         lastResponse=makeError('RPC_RESPONSE_ERROR',msg,0,s.name);
         continue;
@@ -62,4 +62,4 @@ async function perform(method,params,timeout){
 
 export async function baseRpc(method,params=[],timeout=4200,options={}){const key=keyFor(method,params),ttl=options.cache===false?0:cacheTtl(method,params),now=Date.now();if(ttl){const hit=cache.get(key);if(hit&&hit.until>now)return hit.value}if(!options.noDedupe&&inflight.has(key))return inflight.get(key);const p=perform(method,params,timeout).then(v=>{if(ttl){cache.set(key,{value:v,until:Date.now()+ttl});prune()}return v}).finally(()=>inflight.delete(key));if(!options.noDedupe)inflight.set(key,p);return p}
 export async function latestBaseBlock(){return baseRpc('eth_blockNumber',[],3500)}
-export function rpcHealth(){const now=Date.now();return{lastProvider:states.slice().sort((a,b)=>b.lastGoodAt-a.lastGoodAt)[0]?.name||null,providers:states.map(s=>({name:s.name,cooldownMs:Math.max(0,s.cooldownUntil-now),failures:s.failures,lastGoodAt:s.lastGoodAt,lastError:s.lastError}))}}
+export function rpcHealth(){const now=Date.now();return{lastProvider:states.slice().sort((a,b)=>b.lastGoodAt-a.lastGoodAt)[0]?.name||null,providers:states.map(s=>({name:s.name,cooldownMs:Math.max(0,s.cooldownUntil-now),failures:s.failures,lastGoodAt:s.lastGoodAt,lastError:s.lastError,requests:s.requests}))}}
