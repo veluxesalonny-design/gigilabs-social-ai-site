@@ -1,0 +1,26 @@
+name: Flash Edge V10.4 Vercel Check
+on:
+  push:
+    branches: [flash-edge-v104-engine]
+    paths:
+      - '.github/workflows/flash-edge-v104-vercel-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vercel-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Vercel token wiring
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "VERCEL_TOKEN_MISSING"
+            exit 2
+          fi
+          npx --yes vercel@latest whoami --token "$VERCEL_TOKEN"
+          echo "VERCEL_TOKEN_OK"
