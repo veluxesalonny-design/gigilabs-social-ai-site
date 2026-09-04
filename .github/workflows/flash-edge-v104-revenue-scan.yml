@@ -13,7 +13,7 @@ permissions:
 jobs:
   revenue-scan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: flash-edge-v104
@@ -29,8 +29,18 @@ jobs:
         run: |
           node --input-type=module <<'NODE'
           import { scanEngine } from './api/engine.js';
+          import { exactBase } from './api/exact.js';
+
+          async function mapLimit(items, limit, fn) {
+            const out = new Array(items.length); let next = 0;
+            async function worker(){ while(true){ const i = next++; if(i >= items.length) return; try { out[i] = await fn(items[i], i); } catch(e){ out[i] = { error: String(e?.message || e) }; } } }
+            await Promise.all(Array.from({length: Math.min(limit, items.length)}, () => worker()));
+            return out;
+          }
+
           const scan = await scanEngine(250000);
-          const rows = (scan.candidates || []).map(c => ({
+          const baseRows = (scan.candidates || []).map(c => ({
+            id: c.id,
             asset: c.assetSymbol,
             route: `${c.buyDex} -> ${c.sellDex}`,
             size: c.borrowUsd,
@@ -40,16 +50,43 @@ jobs:
             safetyReserveUsd: c.exactEnvelope?.safetyReserveUsd ?? null,
             reason: c.exactEnvelope?.exact?.reason ?? null,
           }));
-          const passes = rows.filter(x => x.stage === 'EXACT_PASS' && Number(x.netAfterGas) > 0);
+
+          const screenOnly = (scan.candidates || [])
+            .filter(c => c.exactEnvelope?.stage === 'SCREEN_ONLY')
+            .sort((a,b) => Number(b.spreadBps || 0) - Number(a.spreadBps || 0))
+            .slice(0, 14);
+
+          const deep = await mapLimit(screenOnly, 2, async c => {
+            const seed = Math.max(100, Number(c.borrowUsd || 100));
+            const sizes = [...new Set([seed, Math.max(100, Math.round(seed * 0.5 / 25) * 25)])];
+            const tests = [];
+            for (const size of sizes) {
+              const r = await exactBase({...c, optimalBorrow:size, borrowUsd:size, b:size, gasUsd:.05});
+              tests.push({size, stage:r.stage, netAfterGas:r.exact?.netAfterGas ?? null, safetyReserveUsd:r.safetyReserveUsd ?? null, reason:r.exact?.reason ?? null, blockNumber:r.blockNumber ?? null});
+              if (r.retryAfterMs > 0) break;
+            }
+            tests.sort((a,b) => Number(b.netAfterGas ?? -Infinity) - Number(a.netAfterGas ?? -Infinity));
+            return {id:c.id, asset:c.assetSymbol, route:`${c.buyDex} -> ${c.sellDex}`, spreadBps:Number(c.spreadBps || 0), best:tests[0] || null, tests};
+          });
+
+          const initialPasses = baseRows.filter(x => x.stage === 'EXACT_PASS' && Number(x.netAfterGas) > 0);
+          const deepPasses = deep.filter(x => x?.best?.stage === 'EXACT_PASS' && Number(x?.best?.netAfterGas) > 0);
+          const allPasses = [
+            ...initialPasses.map(x => ({asset:x.asset, route:x.route, spreadBps:x.spreadBps, size:x.size, netAfterGas:x.netAfterGas, source:'initial'})),
+            ...deepPasses.map(x => ({asset:x.asset, route:x.route, spreadBps:x.spreadBps, size:x.best.size, netAfterGas:x.best.netAfterGas, source:'deep'}))
+          ].sort((a,b)=>Number(b.netAfterGas)-Number(a.netAfterGas));
+
           console.log('FLASH_EDGE_REVENUE_SCAN=' + JSON.stringify({
             blockNumber: scan.blockNumber,
             screenPairs: scan.screenPairs,
             screenRouteCount: scan.screenRouteCount,
             searchDepth: scan.searchDepth,
-            exactRoutes: scan.exactRoutes,
-            exactChecks: scan.exactChecks,
-            exactPasses: passes.length,
-            bestPass: passes.sort((a,b)=>Number(b.netAfterGas)-Number(a.netAfterGas))[0] || null,
-            topCandidates: rows.slice(0,20)
+            initialExactRoutes: scan.exactRoutes,
+            initialExactChecks: scan.exactChecks,
+            deepRoutesChecked: deep.length,
+            exactPasses: allPasses.length,
+            bestPass: allPasses[0] || null,
+            topCandidates: baseRows.slice(0,20),
+            deepChecks: deep
           }));
           NODE
