@@ -1,0 +1,27 @@
+name: Flash Edge V10.4 CI
+on:
+  push:
+    branches: [flash-edge-v104-engine]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flash-edge-v104
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: flash-edge-v104/package.json
+      - run: npm install --ignore-scripts
+      - name: Syntax check
+        run: |
+          for f in api/*.js; do echo "checking $f"; node --check "$f"; done
+      - name: Module graph smoke test
+        run: |
+          node -e "Promise.all(['./api/rpc.js','./api/exact.js','./api/prepare.js','./api/engine.js','./api/worker.js','./api/preflight.js','./api/status.js','./api/base-rpc.js'].map(x=>import(x))).then(()=>console.log('V10.4 module graph OK'))"
